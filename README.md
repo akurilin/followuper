@@ -30,6 +30,10 @@ python3 followuper.py --months 3 --source whatsapp
 # Skip thin conversations (fewer than 5 messages in the window):
 python3 followuper.py --months 3 --min-messages 5
 
+# Only surface threads that have gone quiet (default: 7+ days of no activity):
+python3 followuper.py --months 3 --inactive-days 14
+python3 followuper.py --months 3 --inactive-days 0   # include fresh threads too
+
 # Show every message in the window instead of just the last 10:
 python3 followuper.py --months 3 --last 0
 
@@ -47,6 +51,7 @@ python3 followuper.py --months 3 --ignore-file mine.json
 | `--months N` | `3` | How many months back to include. |
 | `--source` | `both` | `both`, `imessage`, or `whatsapp`. |
 | `--min-messages N` | `1` | Drop people with fewer than N messages in the window. |
+| `--inactive-days N` | `7` | Only include threads with no activity in the last N days; fresher ones are skipped. `0` includes everything. |
 | `--last N` | `10` | Show only the most recent N messages per person; `0` for all. |
 | `--ignore-file PATH` | `ignore.json` | People to skip (see below). Defaults to `ignore.json` next to the script. |
 | `--full` | off | Verbose Markdown instead of the default compact format. |
@@ -136,6 +141,10 @@ comes back to life. To drop someone permanently, just delete their line.
 
 ## How it decides what to include
 
+- **Fresh conversations are skipped.** A thread whose most recent message landed within
+  the last `--inactive-days` days (default 7) is still warm and needs no follow-up yet,
+  so it's left out. Only threads that have gone quiet for at least that long surface.
+  Pass `--inactive-days 0` to include everything regardless of recency.
 - **Individuals only — group chats are excluded.**
   iMessage: ignores `chat...` identifiers and any chat with more than one participant.
   WhatsApp: ignores groups, status updates, and system messages.
@@ -146,6 +155,11 @@ comes back to life. To drop someone permanently, just delete their line.
   the ignore list.
 - **People are merged across platforms by phone number** (last 10 digits), so someone
   you talk to on both iMessage and WhatsApp shows up as a single combined section.
+- **Multiple numbers/addresses on one contact card are merged too.** If your Contacts
+  card for someone lists two phone numbers (or a phone and an email), the conversations
+  on each are folded into one section — every number/address on a card shares a single
+  Contacts record, which is what the merge keys on. So a person you text on two numbers
+  is one thread, not two.
 - **Names** come from your Contacts (iMessage) and from WhatsApp's stored contact
   names. When a number isn't in your contacts, the raw number is shown instead.
 
@@ -164,8 +178,9 @@ original files. Files read:
 - **WhatsApp Desktop is not a full archive.** It only contains messages that synced
   while the desktop app was linked to your phone, so its history may be shallower
   than iMessage's.
-- **Email-based iMessage contacts don't merge with WhatsApp.** Merging relies on a
-  shared phone number; someone you reach only by Apple ID email will appear as a
-  separate section from their WhatsApp chat.
+- **Email-based iMessage contacts merge with WhatsApp only via Contacts.** Merging
+  across platforms relies on a shared phone number or a shared contact card. Someone you
+  reach by Apple ID email who is *not* in your Contacts (so the email and their WhatsApp
+  phone can't be tied to one card) will appear as a separate section.
 - Reading `~/Library/Messages/` may require granting your terminal **Full Disk
   Access** in System Settings → Privacy & Security.

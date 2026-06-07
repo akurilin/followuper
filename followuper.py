@@ -15,6 +15,8 @@ Usage:
     python3 followuper.py --months 3 --source imessage    # restrict to one platform
     python3 followuper.py --months 3 --last 25            # show 25 messages/person
     python3 followuper.py --months 3 --last 0             # all messages in window
+    python3 followuper.py --months 3 --inactive-days 14   # only threads quiet 2+ weeks
+    python3 followuper.py --months 3 --inactive-days 0    # include fresh threads too
     python3 followuper.py --months 3 --ignore-file mine.json   # custom ignore list
     python3 followuper.py --months 3 --max-chars 300     # cap each message's length
     python3 followuper.py --months 3 --full              # verbose Markdown instead
@@ -38,7 +40,7 @@ import os
 import re
 import sqlite3
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Apple Core Data epoch offset: seconds between 1970-01-01 and 2001-01-01.
 MAC_EPOCH = 978307200
@@ -215,6 +217,14 @@ class Person:
         if name and name not in [n for n, _ in self.name_candidates]:
             self.name_candidates.append((name, source))
 
+    def absorb(self, other):
+        """Fold another Person — the same human on a different number/address — in."""
+        self.identifiers |= other.identifiers
+        self.sources |= other.sources
+        self.messages.extend(other.messages)
+        for name, source in other.name_candidates:
+            self.add_name(name, source)
+
     @property
     def display_name(self):
         # Prefer a real (alphabetic) name; otherwise fall back to first identifier.
@@ -231,9 +241,86 @@ class Person:
 
 
 # --------------------------------------------------------------------------- #
+# Contacts (name resolution + cross-number identity)
+# --------------------------------------------------------------------------- #
+def load_contacts():
+    """Read the macOS AddressBook (best-effort, read-only).
+
+    Returns three maps:
+      phone_to_name   — normalized phone (last 10 digits) -> display name
+      email_to_name   — lowercase email                   -> display name
+      token_to_record — id_token(phone/email)             -> Contacts record id
+
+    The record id is the crux of cross-number merging: every phone number and email on
+    one contact card shares the same ZABCDRECORD.Z_PK, so two numbers for the same
+    person map to the same record and can be folded into one conversation. All maps are
+    empty if the AddressBook can't be found or read.
+    """
+    phone_to_name, email_to_name, token_to_record = {}, {}, {}
+    sources = glob.glob(os.path.expanduser(
+        "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
+    ))
+    if not sources:
+        return phone_to_name, email_to_name, token_to_record
+    try:
+        conn = sqlite3.connect(f"file:{sources[0]}?mode=ro", uri=True)
+        # ZOWNER points at the owning ZABCDRECORD row — the per-person identity.
+        for row in conn.execute("""
+            SELECT p.ZFULLNUMBER, p.ZOWNER, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION
+            FROM ZABCDPHONENUMBER p
+            JOIN ZABCDRECORD r ON p.ZOWNER = r.Z_PK
+        """):
+            name = (f"{row[2] or ''} {row[3] or ''}".strip() or row[4] or row[5] or None)
+            key = normalize_phone(row[0])
+            if key:
+                token_to_record.setdefault(key, row[1])
+                if name:
+                    phone_to_name.setdefault(key, name)
+        for row in conn.execute("""
+            SELECT e.ZADDRESS, e.ZOWNER, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION
+            FROM ZABCDEMAILADDRESS e
+            JOIN ZABCDRECORD r ON e.ZOWNER = r.Z_PK
+        """):
+            name = (f"{row[2] or ''} {row[3] or ''}".strip() or row[4] or row[5] or None)
+            if row[0]:
+                token_to_record.setdefault(row[0].lower(), row[1])
+                if name:
+                    email_to_name.setdefault(row[0].lower(), name)
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"# Note: could not read Contacts DB: {exc}", file=sys.stderr)
+    return phone_to_name, email_to_name, token_to_record
+
+
+def merge_by_contact(persons, token_to_record):
+    """Collapse Person fragments that belong to one Contacts card into one conversation.
+
+    Someone with two phone numbers (or a phone and an email) on a single card is one
+    human; keyed by raw identifier alone they'd show up as separate sections. Anyone not
+    in Contacts — or whose card can't be matched — is left exactly as-is, keyed by their
+    own identifier. Discovery order is preserved so later sorting is unaffected.
+    """
+    merged = {}
+    order = []
+    for person in persons:
+        record = None
+        for ident in person.identifiers:
+            record = token_to_record.get(id_token(ident))
+            if record is not None:
+                break
+        key = ("contact", record) if record is not None else person.key
+        if key in merged:
+            merged[key].absorb(person)
+        else:
+            merged[key] = person
+            order.append(key)
+    return [merged[k] for k in order]
+
+
+# --------------------------------------------------------------------------- #
 # iMessage collection
 # --------------------------------------------------------------------------- #
-def collect_imessage(people, cutoff_epoch):
+def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     chat_db = os.path.expanduser("~/Library/Messages/chat.db")
     if not os.path.exists(chat_db):
         print(f"# Note: iMessage database not found at {chat_db}", file=sys.stderr)
@@ -241,36 +328,6 @@ def collect_imessage(people, cutoff_epoch):
 
     conn = sqlite3.connect(f"file:{chat_db}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-
-    # Attach Contacts for name resolution (best-effort).
-    phone_to_name, email_to_name = {}, {}
-    sources = glob.glob(os.path.expanduser(
-        "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
-    ))
-    if sources:
-        try:
-            conn.execute(f"ATTACH DATABASE 'file:{sources[0]}?mode=ro' AS contacts")
-            for row in conn.execute("""
-                SELECT p.ZFULLNUMBER, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION
-                FROM contacts.ZABCDPHONENUMBER p
-                JOIN contacts.ZABCDRECORD r ON p.ZOWNER = r.Z_PK
-            """):
-                name = (f"{row[1] or ''} {row[2] or ''}".strip()
-                        or row[3] or row[4] or None)
-                key = normalize_phone(row[0])
-                if key and name:
-                    phone_to_name.setdefault(key, name)
-            for row in conn.execute("""
-                SELECT e.ZADDRESS, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION
-                FROM contacts.ZABCDEMAILADDRESS e
-                JOIN contacts.ZABCDRECORD r ON e.ZOWNER = r.Z_PK
-            """):
-                name = (f"{row[1] or ''} {row[2] or ''}".strip()
-                        or row[3] or row[4] or None)
-                if row[0] and name:
-                    email_to_name.setdefault(row[0].lower(), name)
-        except sqlite3.Error as exc:
-            print(f"# Note: could not read Contacts DB: {exc}", file=sys.stderr)
 
     def resolve(identifier):
         if not identifier:
@@ -530,6 +587,10 @@ def main():
                         default="both", help="Which platform(s) to read (default: both).")
     parser.add_argument("--min-messages", type=int, default=1,
                         help="Skip people with fewer than this many messages in the window.")
+    parser.add_argument("--inactive-days", type=int, default=7,
+                        help="Only include conversations with no activity in the last N "
+                             "days; anything more recent is still 'fresh' and skipped "
+                             "(default: 7). Use 0 to include even fresh conversations.")
     parser.add_argument("--last", type=int, default=10,
                         help="Show only the most recent N messages per person "
                              "(default: 10; use 0 for all messages in the window).")
@@ -553,18 +614,35 @@ def main():
         parser.error("--last must be a non-negative integer (0 means unlimited)")
     if args.max_chars < 0:
         parser.error("--max-chars must be a non-negative integer")
+    if args.inactive_days < 0:
+        parser.error("--inactive-days must be a non-negative integer (0 means unlimited)")
 
     cutoff_epoch, cutoff_dt = months_ago_epoch(args.months)
 
+    phone_to_name, email_to_name, token_to_record = load_contacts()
+
     people = {}
     if args.source in ("both", "imessage"):
-        collect_imessage(people, cutoff_epoch)
+        collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name)
     if args.source in ("both", "whatsapp"):
         collect_whatsapp(people, cutoff_epoch)
 
+    # Fold together the numbers/addresses that belong to one Contacts card, so a person
+    # you reach on two phones (or phone + WhatsApp) is a single conversation. Done before
+    # the min-messages and inactivity filters so those judge the merged thread, not a
+    # fragment of it.
+    persons = merge_by_contact(list(people.values()), token_to_record)
+
     # Drop empty / below-threshold people, order by most recent activity.
-    persons = [p for p in people.values() if len(p.messages) >= args.min_messages]
+    persons = [p for p in persons if len(p.messages) >= args.min_messages]
     persons.sort(key=lambda p: p.last_ts, reverse=True)
+
+    # Hide conversations that are still fresh: if the last message landed within the
+    # inactivity window, the thread is warm and needs no follow-up yet. We only surface
+    # people who have gone quiet for at least `--inactive-days`.
+    if args.inactive_days:
+        fresh_cutoff = (datetime.now() - timedelta(days=args.inactive_days)).timestamp()
+        persons = [p for p in persons if p.last_ts < fresh_cutoff]
 
     # Apply the ignore list. A snoozed person is hidden unless their most recent
     # message is dated after the snooze date — in which case they reappear, flagged.
@@ -580,9 +658,11 @@ def main():
         # else: still snoozed — drop silently.
     persons = kept
 
+    quiet_note = (f" quiet for {args.inactive_days}+ day(s)"
+                  if args.inactive_days else "")
     window_note = (f"Window: last {args.months} month(s) "
                    f"(since {cutoff_dt.strftime('%Y-%m-%d %H:%M')}). "
-                   f"{len(persons)} individual conversation(s).")
+                   f"{len(persons)} individual conversation(s){quiet_note}.")
 
     out = sys.stdout
     if args.full:
