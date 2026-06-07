@@ -1,2 +1,5 @@
 # Your real ignore list holds personal contacts — keep it out of git.
 ignore.json
+
+# Python bytecode cache.
+__pycache__/

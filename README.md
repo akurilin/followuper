@@ -44,6 +44,26 @@ python3 followuper.py --months 3 --max-chars 300
 python3 followuper.py --months 3 --ignore-file mine.json
 ```
 
+## Reviewing follow-ups with Claude
+
+`followups.sh` runs the export and pipes it into Claude Code's headless mode
+(`claude -p`) to get back a prioritized list of who needs a reply from you — no
+interactive session required:
+
+```bash
+./followups.sh                 # defaults: 2-month window, include fresh threads
+./followups.sh --months 3      # any flags are forwarded to followuper.py
+```
+
+The criteria for what counts as a follow-up and the output format live inline in the
+script. The export (full of private message content) is piped straight into `claude -p`
+over stdin, so it never touches disk beyond the model's own context.
+
+While it runs, `followuper.py` logs its export progress to **stderr** (reading Contacts,
+iMessage, WhatsApp, with message counts), so the export phase isn't opaque. Progress
+goes to stderr and the report to stdout, so `./followups.sh > out.md` still captures a
+clean report while you watch progress in the terminal.
+
 ### Options
 
 | Option | Default | Meaning |

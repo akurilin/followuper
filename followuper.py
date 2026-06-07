@@ -52,6 +52,17 @@ ME_LABEL = "Me"
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+def log(message):
+    """Print a progress line to stderr.
+
+    Progress goes to stderr, never stdout: stdout is the data stream (it may be
+    redirected to a file or piped into another tool, e.g. `claude -p`), and these
+    lines are just for a human watching the run. They carry only counts, never
+    message content.
+    """
+    print(message, file=sys.stderr, flush=True)
+
+
 def months_ago_epoch(months):
     """Return the unix timestamp `months` calendar months before now (local)."""
     now = datetime.now()
@@ -619,13 +630,22 @@ def main():
 
     cutoff_epoch, cutoff_dt = months_ago_epoch(args.months)
 
+    log("Reading Contacts…")
     phone_to_name, email_to_name, token_to_record = load_contacts()
+    log(f"  {len(phone_to_name)} phone + {len(email_to_name)} email name(s) from Contacts")
 
     people = {}
     if args.source in ("both", "imessage"):
+        log("Reading iMessage…")
         collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name)
+        log(f"  {sum(len(p.messages) for p in people.values())} message(s) so far")
     if args.source in ("both", "whatsapp"):
+        before = sum(len(p.messages) for p in people.values())
+        log("Reading WhatsApp…")
         collect_whatsapp(people, cutoff_epoch)
+        log(f"  {sum(len(p.messages) for p in people.values()) - before} WhatsApp message(s)")
+
+    log("Merging contacts and applying filters…")
 
     # Fold together the numbers/addresses that belong to one Contacts card, so a person
     # you reach on two phones (or phone + WhatsApp) is a single conversation. Done before
@@ -657,6 +677,8 @@ def main():
             kept.append(person)
         # else: still snoozed — drop silently.
     persons = kept
+
+    log(f"Done: {len(persons)} conversation(s) to review.")
 
     quiet_note = (f" quiet for {args.inactive_days}+ day(s)"
                   if args.inactive_days else "")
