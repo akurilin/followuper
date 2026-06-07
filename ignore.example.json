@@ -1,0 +1,5 @@
+{
+  "+15550000001": { "since": "2026-06-06", "note": "label" },
+  "+15550000002": "2026-06-06",
+  "someone@example.com": { "since": "2026-06-06", "note": "old coworker" }
+}

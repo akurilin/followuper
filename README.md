@@ -1,0 +1,171 @@
+# followuper
+
+Export your one-on-one **iMessage** and **WhatsApp** conversations so you can review
+who you've been talking to and follow up.
+
+`followuper.py` reads your local macOS message databases, finds the individual
+(non-group) conversations that had any activity in the last *N* months, merges the
+two platforms per person, and prints a dated, per-person summary to stdout. By default
+it uses a token-lean compact format (one line per message) suited to feeding into an
+AI; pass `--full` for verbose, human-readable Markdown.
+
+## Requirements
+
+- macOS, with the Messages app and/or WhatsApp Desktop set up on this machine.
+- Python 3 (uses only the standard library — **no dependencies, no virtualenv**).
+
+## Usage
+
+```bash
+# Last 3 months, compact output to stdout (redirect to save it):
+python3 followuper.py --months 3 > conversations.md
+
+# Verbose, human-readable Markdown instead:
+python3 followuper.py --months 3 --full
+
+# Only one platform:
+python3 followuper.py --months 3 --source imessage
+python3 followuper.py --months 3 --source whatsapp
+
+# Skip thin conversations (fewer than 5 messages in the window):
+python3 followuper.py --months 3 --min-messages 5
+
+# Show every message in the window instead of just the last 10:
+python3 followuper.py --months 3 --last 0
+
+# Cap each message's length (handy for trimming long pasted text):
+python3 followuper.py --months 3 --max-chars 300
+
+# Use a custom ignore list:
+python3 followuper.py --months 3 --ignore-file mine.json
+```
+
+### Options
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--months N` | `3` | How many months back to include. |
+| `--source` | `both` | `both`, `imessage`, or `whatsapp`. |
+| `--min-messages N` | `1` | Drop people with fewer than N messages in the window. |
+| `--last N` | `10` | Show only the most recent N messages per person; `0` for all. |
+| `--ignore-file PATH` | `ignore.json` | People to skip (see below). Defaults to `ignore.json` next to the script. |
+| `--full` | off | Verbose Markdown instead of the default compact format. |
+| `--max-chars N` | `0` | Truncate each message to N chars; `0` = no limit. |
+
+## Output format (default: compact)
+
+The default format is built to minimize tokens when feeding the export to a model —
+e.g. "which threads did I drop?" — by stripping the repetition that otherwise
+dominates the size:
+
+- the contact's name and the date are printed **once**, not on every message line;
+- direction is a single arrow (`->` you sent, `<-` they sent);
+- the date appears once per day, with just `HH:MM` per message;
+- URLs collapse to a `[domain]` marker;
+- `--max-chars` optionally caps long pasted messages.
+
+```
+# Jordan Lee
+iMessage · +15550000001 · 29 msgs · last: them 06-06 14:23
+05-18
+16:39 <- Good luck tomorrow!
+16:51 -> Thank you, I pushed it back a week to prep more.
+05-23
+16:46 <- Totally understand. Rooting for you.
+```
+
+The header line carries the highest-signal facts for follow-up: who sent the **last**
+message and when. On a typical two-month export the compact format roughly halves the
+token count versus `--full` (and `--max-chars 300` saves more again). The first line of
+the document states the arrow convention so the model doesn't have to guess.
+
+## Full format (`--full`)
+
+A more readable per-person section: resolved name, platforms, identifiers, a message
+count, and the last-message time, followed by the conversation. Messages from both
+platforms are interleaved in chronological order and tagged with their source.
+Messages you sent are labelled `Me`.
+
+```markdown
+# Jordan Lee
+
+- **Sources:** iMessage, WhatsApp
+- **Identifiers:** +15550000001, jordan@example.com
+- **Messages shown:** 10 of 42 in window
+- **Last message:** 2026-06-01 18:30
+
+## Conversation
+
+**2026-05-10 09:15 — Me** (iMessage)
+are we still on for friday?
+
+**2026-05-10 09:18 — Jordan Lee** (WhatsApp)
+yes! see you then
+```
+
+## Ignoring people you don't need to follow up with
+
+List them in an ignore file (default `ignore.json` next to the script). Each entry is
+keyed by a **stable identifier** — a phone number, an email, or a WhatsApp JID —
+mapped to the date you snoozed them. The value can be a bare date, or an object with a
+`note` for readability. See `ignore.example.json` for the shape:
+
+```json
+{
+  "+15550000001": { "since": "2026-06-06", "note": "label" },
+  "+15550000002": "2026-06-06",
+  "someone@example.com": { "since": "2026-06-06", "note": "old coworker" }
+}
+```
+
+Why identifiers instead of names: names are ambiguous (two different people can share a
+name, display names can contain emoji, etc.). Phone numbers are matched on their last
+10 digits, so the same person is pinned whether they show up via iMessage, a WhatsApp
+phone JID, or a contacts-formatted number. A name can still be used as a key as a
+fallback, but an ID is reliable. The matching identifiers for anyone are printed in
+their section, so you can copy one straight from there.
+
+**Auto-resurfacing:** a snoozed person stays hidden only while their most recent
+message is on or before the `since` date. The moment they send something newer, they
+reappear in the report, flagged as resurfaced. Nothing is rewritten — the date itself
+is the rule — so you never have to manually prune the list when a dropped connection
+comes back to life. To drop someone permanently, just delete their line.
+
+> Your real `ignore.json` holds personal contacts, so it is **git-ignored**. Only the
+> fictitious `ignore.example.json` is tracked.
+
+## How it decides what to include
+
+- **Individuals only — group chats are excluded.**
+  iMessage: ignores `chat...` identifiers and any chat with more than one participant.
+  WhatsApp: ignores groups, status updates, and system messages.
+- **Automated senders are excluded.** iMessage SMS short codes (≤6-digit numeric
+  identifiers) and toll-free numbers (1-800/833/844/855/866/877/888) are businesses and
+  automations (carrier texts, reservation bots, event blasts, …), never people to
+  follow up with. A stray automated sender from a normal-looking number can be added to
+  the ignore list.
+- **People are merged across platforms by phone number** (last 10 digits), so someone
+  you talk to on both iMessage and WhatsApp shows up as a single combined section.
+- **Names** come from your Contacts (iMessage) and from WhatsApp's stored contact
+  names. When a number isn't in your contacts, the raw number is shown instead.
+
+## Safety: the databases are never modified
+
+Both databases are opened **strictly read-only** (SQLite `mode=ro`), and the script
+only ever runs `SELECT` queries. It never writes to, copies over, or alters the
+original files. Files read:
+
+- iMessage: `~/Library/Messages/chat.db`
+- Contacts (for names): `~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb`
+- WhatsApp: `~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite`
+
+## Known limitations
+
+- **WhatsApp Desktop is not a full archive.** It only contains messages that synced
+  while the desktop app was linked to your phone, so its history may be shallower
+  than iMessage's.
+- **Email-based iMessage contacts don't merge with WhatsApp.** Merging relies on a
+  shared phone number; someone you reach only by Apple ID email will appear as a
+  separate section from their WhatsApp chat.
+- Reading `~/Library/Messages/` may require granting your terminal **Full Disk
+  Access** in System Settings → Privacy & Security.
