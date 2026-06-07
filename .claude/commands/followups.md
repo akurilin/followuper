@@ -6,16 +6,30 @@ Run the export script and tell me which conversations need a follow-up from me.
 
 ## Step 1 — run the script
 
+**Always redirect the export to a file in `/tmp`. Never let it reach the conversation.**
+Run *exactly* this — nothing else:
+
 ```bash
-python3 followuper.py --months 2 --inactive-days 0
+python3 followuper.py --months 2 --inactive-days 0 > /tmp/followuper_export.md
 ```
+
+Then open `/tmp/followuper_export.md` with the Read tool and analyze from there. Do
+**not** run the script bare, and do **not** pipe it through `head`/`tail`/`rg`/`cat` or
+otherwise route its output back through a tool result — that puts personal message content
+into Claude's context.
+
+Why this matters: the export is full of private message content. Any of it that flows
+through a Bash result (stdout, a pipe, a preview) gets persisted by the harness under the
+project's `tool-results/` folder, where it lingers for weeks. The redirect keeps the Bash
+result empty (nothing to persist), and the `/tmp` file self-deletes via macOS's 3-day temp
+cleanup. Re-runs overwrite the same path.
 
 Defaults: a 2-month window and `--inactive-days 0` (include fresh threads too — do
 *not* hide recently-active conversations). If I gave arguments, treat them as overrides:
 `$ARGUMENTS` (e.g. a number = months, or any explicit `--flag`).
 
-Read the full output. It may be large and get saved to a file — read all of it before
-analyzing; don't answer from a truncated preview.
+Read the **whole** file before analyzing — it may be large; never answer from a truncated
+preview.
 
 ## Step 2 — decide what needs a follow-up
 
