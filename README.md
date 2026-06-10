@@ -24,6 +24,104 @@ person, and prints a dated timeline whose header line carries the highest-signal
 who sent the **last** message and when. Pipe it into Claude and you get back a
 prioritized list of who you owe a reply.
 
+## Example output
+
+What `./followups.sh` gives you — a real session, with every name, number, company,
+and identifying detail changed:
+
+```text
+$ ./followups.sh
+Reading Contacts…
+  1008 phone + 41 email name(s) from Contacts
+Reading iMessage…
+  2117 message(s), 172 reaction(s) so far
+Reading WhatsApp…
+  2066 WhatsApp message(s), 85 reaction(s)
+Reading Mail…
+  7 group email(s) skipped (4+ people)
+  103 mail message(s)
+Reading Calendar…
+  74 calendar event(s) in window
+Merging contacts and applying filters…
+Done: 121 conversation(s) to review.
+
+Here's your follow-up triage.
+
+## 🔴 Time-sensitive
+
+**Jordan Lee** — 1pm call tentatively set for **this Thursday (06-12)**; Jordan
+was sending a calendar invite to you@example.com. Confirm it arrived or reach
+out now to lock it down.
+> "1pm is great... I will send you a calendar invite" / "Sure thing,
+> you@example.com 👍"
+
+## 🟠 Open commitments — things you owe
+
+**Marcus Webb** (recruiter, Northstar Talent) — you promised to come back on
+his curated role list (Lumen, Driftwave, Keystone AI…) and have gone quiet
+6 days.
+> "Hey Marcus… Let me do some research here and get back to you as soon as
+> I can." (06-04)
+
+**Priya** (+1 555 014-2233, Harbor Search Partners) — she's waiting on the
+blurb for your former colleague so she can forward it. You said you'd send it
+and haven't.
+> Her: "do you have a blurb I can forward along?" → You: "Yep, let me get that
+> for you" (06-09)
+
+**Theo** (+1 555 020-7788) — offered an intro to an exec search firm; the ball
+is literally "send your email." The thread stops there.
+> Him: "Send me your email if you need an intro." (06-10)
+
+## 🟡 Stale / overdue loops
+
+**Sam Porter** — wanted to hang once you were back in town; you've been back
+since ~04-28 and it never got rescheduled. Last word was his.
+> "Dinner club isn't the same without you!" (04-16)
+> ⚠️ You do have a "tentative hang w/ Sam" on the calendar 06-18 — if that's
+> this, it may already be handled.
+
+**Felix Tan** — you floated a catch-up / coworking session that fizzled into
+event chit-chat and never got pinned down.
+> You: "let's catch up soon… or do a coworking sesh while the weather
+> holds!" (06-01)
+
+## ⚪ Optional — keep-warm
+
+**Kenji** — friend abroad asked you a direct question and it's sitting
+unanswered. Worth a quick reply (the interview loop wrapped, so you have an
+answer).
+> "Thanks for checking up. How'd the interviews go!?" (06-09)
+
+**Elena Ruiz** — newer contact, friendly thread trailed off on her health
+update. Light keep-warm only.
+> "So far so good 🤞" (05-17)
+
+---
+
+**Excluded as not-your-court** (sanity check):
+- **You sent last, they owe the reply:** Maya, Ravi, Joelle, Tomas, the
+  accountant thread.
+- **Booked on your calendar** (so the scheduling thread is settled): Lena
+  (6/17 lunch), Marcus F. (6/12), Noah (6/4 catchup happened + intro email
+  sent).
+- **Cleanly closed:** goodbyes, graceful dating closures, "thanks!" enders.
+- **Intros where you bowed out**, **transactional / bots / spam**, and
+  **sticker-only threads.**
+
+One I want a gut-check on: **Sam Porter** — is the 06-18 tentative calendar
+hang the same thing? If so I'll drop him.
+
+Want me to draft replies? I'd start with **Priya** and **Theo** (one-liners
+that unblock your colleague's search), then a proper note back to **Marcus**.
+```
+
+Note the calendar section earning its keep twice: the tentative 06-18 hang
+demotes a "stale loop" to a gut-check, and the booked lunches keep settled
+scheduling threads out of the list entirely. The `(+1 other)` intro email shows
+up too — "intro email sent" is what keeps Noah off the follow-up list. The
+sections below explain how each of these pieces works.
+
 ## Highlights
 
 - **One merged timeline per person.** iMessage and WhatsApp threads are folded together
@@ -245,101 +343,7 @@ iMessage, WhatsApp, with message counts), so the export phase isn't opaque. Prog
 goes to stderr and the report to stdout, so `./followups.sh > out.md` still captures a
 clean report while you watch progress in the terminal.
 
-### Example run
-
-A real session, with every name, number, company, and identifying detail changed:
-
-```text
-$ ./followups.sh
-Reading Contacts…
-  1008 phone + 41 email name(s) from Contacts
-Reading iMessage…
-  2117 message(s), 172 reaction(s) so far
-Reading WhatsApp…
-  2066 WhatsApp message(s), 85 reaction(s)
-Reading Mail…
-  7 group email(s) skipped (4+ people)
-  103 mail message(s)
-Reading Calendar…
-  74 calendar event(s) in window
-Merging contacts and applying filters…
-Done: 121 conversation(s) to review.
-
-Here's your follow-up triage.
-
-## 🔴 Time-sensitive
-
-**Jordan Lee** — 1pm call tentatively set for **this Thursday (06-12)**; Jordan
-was sending a calendar invite to you@example.com. Confirm it arrived or reach
-out now to lock it down.
-> "1pm is great... I will send you a calendar invite" / "Sure thing,
-> you@example.com 👍"
-
-## 🟠 Open commitments — things you owe
-
-**Marcus Webb** (recruiter, Northstar Talent) — you promised to come back on
-his curated role list (Lumen, Driftwave, Keystone AI…) and have gone quiet
-6 days.
-> "Hey Marcus… Let me do some research here and get back to you as soon as
-> I can." (06-04)
-
-**Priya** (+1 555 014-2233, Harbor Search Partners) — she's waiting on the
-blurb for your former colleague so she can forward it. You said you'd send it
-and haven't.
-> Her: "do you have a blurb I can forward along?" → You: "Yep, let me get that
-> for you" (06-09)
-
-**Theo** (+1 555 020-7788) — offered an intro to an exec search firm; the ball
-is literally "send your email." The thread stops there.
-> Him: "Send me your email if you need an intro." (06-10)
-
-## 🟡 Stale / overdue loops
-
-**Sam Porter** — wanted to hang once you were back in town; you've been back
-since ~04-28 and it never got rescheduled. Last word was his.
-> "Dinner club isn't the same without you!" (04-16)
-> ⚠️ You do have a "tentative hang w/ Sam" on the calendar 06-18 — if that's
-> this, it may already be handled.
-
-**Felix Tan** — you floated a catch-up / coworking session that fizzled into
-event chit-chat and never got pinned down.
-> You: "let's catch up soon… or do a coworking sesh while the weather
-> holds!" (06-01)
-
-## ⚪ Optional — keep-warm
-
-**Kenji** — friend abroad asked you a direct question and it's sitting
-unanswered. Worth a quick reply (the interview loop wrapped, so you have an
-answer).
-> "Thanks for checking up. How'd the interviews go!?" (06-09)
-
-**Elena Ruiz** — newer contact, friendly thread trailed off on her health
-update. Light keep-warm only.
-> "So far so good 🤞" (05-17)
-
----
-
-**Excluded as not-your-court** (sanity check):
-- **You sent last, they owe the reply:** Maya, Ravi, Joelle, Tomas, the
-  accountant thread.
-- **Booked on your calendar** (so the scheduling thread is settled): Lena
-  (6/17 lunch), Marcus F. (6/12), Noah (6/4 catchup happened + intro email
-  sent).
-- **Cleanly closed:** goodbyes, graceful dating closures, "thanks!" enders.
-- **Intros where you bowed out**, **transactional / bots / spam**, and
-  **sticker-only threads.**
-
-One I want a gut-check on: **Sam Porter** — is the 06-18 tentative calendar
-hang the same thing? If so I'll drop him.
-
-Want me to draft replies? I'd start with **Priya** and **Theo** (one-liners
-that unblock your colleague's search), then a proper note back to **Marcus**.
-```
-
-Note the calendar section earning its keep twice: the tentative 06-18 hang
-demotes a "stale loop" to a gut-check, and the booked lunches keep settled
-scheduling threads out of the list entirely. The `(+1 other)` intro email shows
-up too — "intro email sent" is what keeps Noah off the follow-up list.
+See [Example output](#example-output) near the top for a full annotated run.
 
 ## Output format (default: compact)
 
