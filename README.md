@@ -30,6 +30,10 @@ python3 followuper.py --months 3 --source whatsapp
 # Skip thin conversations (fewer than 5 messages in the window):
 python3 followuper.py --months 3 --min-messages 5
 
+# Only surface threads that have gone quiet (default: 7+ days of no activity):
+python3 followuper.py --months 3 --inactive-days 14
+python3 followuper.py --months 3 --inactive-days 0   # include fresh threads too
+
 # Show every message in the window instead of just the last 10:
 python3 followuper.py --months 3 --last 0
 
@@ -40,6 +44,26 @@ python3 followuper.py --months 3 --max-chars 300
 python3 followuper.py --months 3 --ignore-file mine.json
 ```
 
+## Reviewing follow-ups with Claude
+
+`followups.sh` runs the export and pipes it into Claude Code's headless mode
+(`claude -p`) to get back a prioritized list of who needs a reply from you — no
+interactive session required:
+
+```bash
+./followups.sh                 # defaults: 2-month window, include fresh threads
+./followups.sh --months 3      # any flags are forwarded to followuper.py
+```
+
+The criteria for what counts as a follow-up and the output format live inline in the
+script. The export (full of private message content) is piped straight into `claude -p`
+over stdin, so it never touches disk beyond the model's own context.
+
+While it runs, `followuper.py` logs its export progress to **stderr** (reading Contacts,
+iMessage, WhatsApp, with message counts), so the export phase isn't opaque. Progress
+goes to stderr and the report to stdout, so `./followups.sh > out.md` still captures a
+clean report while you watch progress in the terminal.
+
 ### Options
 
 | Option | Default | Meaning |
@@ -47,8 +71,10 @@ python3 followuper.py --months 3 --ignore-file mine.json
 | `--months N` | `3` | How many months back to include. |
 | `--source` | `both` | `both`, `imessage`, or `whatsapp`. |
 | `--min-messages N` | `1` | Drop people with fewer than N messages in the window. |
+| `--inactive-days N` | `7` | Only include threads with no activity in the last N days; fresher ones are skipped. `0` includes everything. |
 | `--last N` | `10` | Show only the most recent N messages per person; `0` for all. |
 | `--ignore-file PATH` | `ignore.json` | People to skip (see below). Defaults to `ignore.json` next to the script. |
+| `--ignore [NAME]` | — | Maintenance mode: search Contacts by name and add the person you pick to the ignore file (instead of exporting). See below. |
 | `--full` | off | Verbose Markdown instead of the default compact format. |
 | `--max-chars N` | `0` | Truncate each message to N chars; `0` = no limit. |
 
@@ -125,6 +151,22 @@ phone JID, or a contacts-formatted number. A name can still be used as a key as 
 fallback, but an ID is reliable. The matching identifiers for anyone are printed in
 their section, so you can copy one straight from there.
 
+### Adding someone by name
+
+You rarely know a number off the top of your head, and a contact may have several. So
+instead of editing the JSON by hand, run the picker:
+
+```bash
+python3 followuper.py --ignore            # prompts for a name to search
+python3 followuper.py --ignore "Diana"    # pre-fills the search with "Diana"
+```
+
+It searches your macOS Contacts by name, lists the matches with **all** the numbers and
+emails on each card, and snoozes the one you pick — writing every identifier on that
+card to the ignore file with today's date. One pick covers a person no matter which of
+their numbers they text from. It loops so you can add several in a sitting; a blank
+search quits.
+
 **Auto-resurfacing:** a snoozed person stays hidden only while their most recent
 message is on or before the `since` date. The moment they send something newer, they
 reappear in the report, flagged as resurfaced. Nothing is rewritten — the date itself
@@ -136,6 +178,10 @@ comes back to life. To drop someone permanently, just delete their line.
 
 ## How it decides what to include
 
+- **Fresh conversations are skipped.** A thread whose most recent message landed within
+  the last `--inactive-days` days (default 7) is still warm and needs no follow-up yet,
+  so it's left out. Only threads that have gone quiet for at least that long surface.
+  Pass `--inactive-days 0` to include everything regardless of recency.
 - **Individuals only — group chats are excluded.**
   iMessage: ignores `chat...` identifiers and any chat with more than one participant.
   WhatsApp: ignores groups, status updates, and system messages.
@@ -146,6 +192,11 @@ comes back to life. To drop someone permanently, just delete their line.
   the ignore list.
 - **People are merged across platforms by phone number** (last 10 digits), so someone
   you talk to on both iMessage and WhatsApp shows up as a single combined section.
+- **Multiple numbers/addresses on one contact card are merged too.** If your Contacts
+  card for someone lists two phone numbers (or a phone and an email), the conversations
+  on each are folded into one section — every number/address on a card shares a single
+  Contacts record, which is what the merge keys on. So a person you text on two numbers
+  is one thread, not two.
 - **Names** come from your Contacts (iMessage) and from WhatsApp's stored contact
   names. When a number isn't in your contacts, the raw number is shown instead.
 
@@ -164,8 +215,9 @@ original files. Files read:
 - **WhatsApp Desktop is not a full archive.** It only contains messages that synced
   while the desktop app was linked to your phone, so its history may be shallower
   than iMessage's.
-- **Email-based iMessage contacts don't merge with WhatsApp.** Merging relies on a
-  shared phone number; someone you reach only by Apple ID email will appear as a
-  separate section from their WhatsApp chat.
+- **Email-based iMessage contacts merge with WhatsApp only via Contacts.** Merging
+  across platforms relies on a shared phone number or a shared contact card. Someone you
+  reach by Apple ID email who is *not* in your Contacts (so the email and their WhatsApp
+  phone can't be tied to one card) will appear as a separate section.
 - Reading `~/Library/Messages/` may require granting your terminal **Full Disk
   Access** in System Settings → Privacy & Security.
