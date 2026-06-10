@@ -104,8 +104,11 @@ an inbox is mostly machines — so inclusion is **gated on engagement**:
 - **An incoming sender appears only if you've *ever* sent them an email** — any
   recipient of your outgoing mail, however old, counts — **or they're in Contacts.**
   Senders you never replied to are cold outreach and never reach the report.
-- **1-on-1 only**, mirroring the chat sources: incoming mail must be addressed to just
-  you, outgoing mail to exactly one person.
+- **1-on-1 plus three-way**, mirroring the chat sources' no-group-chats rule with one
+  carve-out: threads of you and exactly two others stay in, because that's the shape
+  of an introduction — the most follow-up-laden email there is. An intro lands in
+  both recipients' sections, marked `(+1 other)`. Bigger threads are group
+  conversations and out of scope; each run logs to stderr how many were skipped.
 
 Message bodies are read from Mail's downloaded `.emlx` files, trimmed of quoted reply
 chains and signatures, and capped at 400 characters — the export needs the ask, not

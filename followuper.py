@@ -863,8 +863,12 @@ def collect_mail(people, cutoff_epoch, email_to_name):
     - Engagement gate: an incoming message counts only if I've EVER sent that
       person an email (i.e. they appear as a recipient of my outgoing mail) or
       they're in Contacts. Senders I never replied to are cold outreach/noise.
-    - 1-on-1 only, mirroring the chat sources: incoming must be addressed to
-      just me; outgoing must have exactly one recipient besides me.
+    - 1-on-1 plus three-way, mirroring the chat sources' no-group-chats rule
+      with one carve-out: threads of me + two others stay in, because that's
+      the shape of an introduction — the most follow-up-laden mail there is
+      (an intro lands in both recipients' timelines, marked "(+1 other)").
+      Anything bigger is a group conversation, out of scope exactly like
+      group chats; every run logs how many were skipped for this.
 
     Bodies come from .emlx files (named by messages.ROWID) when Mail has
     downloaded them; otherwise the subject alone stands in. Envelope Index
@@ -918,7 +922,7 @@ def collect_mail(people, cutoff_epoch, email_to_name):
         if stem.isdigit():
             emlx_paths[int(stem)] = path
 
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT m.ROWID AS rowid, m.global_message_id AS gid,
                lower(sa.address) AS sender, sa.comment AS sender_name,
                s.subject AS subject,
@@ -929,15 +933,20 @@ def collect_mail(people, cutoff_epoch, email_to_name):
         JOIN mailboxes b ON m.mailbox = b.ROWID
         WHERE COALESCE(m.date_received, m.date_sent) >= CAST(? AS INTEGER)
           AND m.deleted = 0
-          AND IFNULL(m.list_id_hash, 0) = 0
-          AND IFNULL(m.unsubscribe_type, 0) = 0
-          AND IFNULL(m.automated_conversation, 0) = 0
+          -- The automated-mail classifiers describe senders, and I'm not a bot:
+          -- they misfire on ordinary sent mail (seen on a real intro email), so
+          -- they only apply to incoming messages.
+          AND (lower(sa.address) IN ({my_ph})
+               OR (IFNULL(m.list_id_hash, 0) = 0
+                   AND IFNULL(m.unsubscribe_type, 0) = 0
+                   AND IFNULL(m.automated_conversation, 0) = 0))
           AND b.url NOT LIKE '%Trash%' AND b.url NOT LIKE '%Spam%'
           AND b.url NOT LIKE '%Junk%' AND b.url NOT LIKE '%Drafts%'
         ORDER BY ts
-    """, [cutoff_epoch])
+    """, [cutoff_epoch] + my_params)
 
     seen = set()  # global_message_id — Gmail can mirror one message in two mailboxes
+    skipped_group = 0
     for row in rows:
         if row["gid"] in seen:
             continue
@@ -949,15 +958,19 @@ def collect_mail(people, cutoff_epoch, email_to_name):
                   if a not in my_addresses}
 
         if is_from_me:
-            if len(others) != 1:
-                continue              # mass mail / group thread / note-to-self
-            addr, contact_name = next(iter(others.items()))
+            if len(others) > 2:
+                skipped_group += 1    # group conversation — out of scope, like group chats
+                continue
+            if not others:
+                continue              # note-to-self
+            counterparts = others     # an intro belongs in both recipients' timelines
         else:
-            if others:
-                continue              # they wrote to me AND others: group thread
+            if len(others) > 1:
+                skipped_group += 1
+                continue
             if sender not in replied_to and sender not in email_to_name:
                 continue              # never engaged: cold outreach / noise
-            addr, contact_name = sender, row["sender_name"]
+            counterparts = {sender: row["sender_name"]}
 
         subject = " ".join((row["subject"] or "").split())
         body = (read_emlx_body(emlx_paths[row["rowid"]])
@@ -968,19 +981,26 @@ def collect_mail(people, cutoff_epoch, email_to_name):
             text = body or (f"[{subject}]" if subject else None)
         if not text:
             continue
+        # A third participant (intro recipient, reply-all) is real signal: mark it.
+        if len(others) == (2 if is_from_me else 1):
+            text += " (+1 other)"
 
-        key = ("email", addr)
-        person = people.setdefault(key, Person(key))
-        person.identifiers.add(addr)
-        person.sources.add("Mail")
-        person.add_name(email_to_name.get(addr) or (contact_name or "").strip(), "Mail")
-        person.messages.append({
-            "ts": row["ts"],
-            "source": "Mail",
-            "is_from_me": is_from_me,
-            "text": text,
-        })
+        for addr, contact_name in counterparts.items():
+            key = ("email", addr)
+            person = people.setdefault(key, Person(key))
+            person.identifiers.add(addr)
+            person.sources.add("Mail")
+            person.add_name(email_to_name.get(addr) or (contact_name or "").strip(),
+                            "Mail")
+            person.messages.append({
+                "ts": row["ts"],
+                "source": "Mail",
+                "is_from_me": is_from_me,
+                "text": text,
+            })
 
+    if skipped_group:
+        log(f"  {skipped_group} group email(s) skipped (4+ people)")
     conn.close()
 
 
