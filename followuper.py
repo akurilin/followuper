@@ -9,6 +9,11 @@ single Markdown document to stdout (one section per person, every message dated)
 Reactions (iMessage tapbacks, WhatsApp emoji reactions) are attached to the message
 they target, so an acknowledged question reads as acknowledged.
 
+If macOS Calendar.app has accounts synced (Settings → Internet Accounts), the export
+opens with a compact calendar section (last week → next two weeks, read from the
+local Calendar store) so the reviewing model can verify whether discussed meetings
+actually got scheduled instead of flagging them as unconfirmed.
+
 No third-party dependencies — only the Python standard library (sqlite3).
 
 Usage:
@@ -768,6 +773,106 @@ def collect_whatsapp(people, cutoff_epoch):
 
 
 # --------------------------------------------------------------------------- #
+# Calendar (local Apple Calendar store)
+# --------------------------------------------------------------------------- #
+def load_calendar_events(days_back=7, days_ahead=14):
+    """Read events around now from the local Apple Calendar store (read-only).
+
+    macOS Calendar.app syncs Google/iCloud/Exchange accounts into this database via a
+    background daemon, so it serves as a no-auth local mirror of the user's calendars
+    — the same trick as reading chat.db, and the reason this needs no Google Cloud
+    project or OAuth dance. The events let the reviewing model cross-check scheduling
+    threads ("did that meeting invite ever arrive?") instead of guessing from chat.
+
+    Returns a list of dicts sorted by start time, each with attendee emails (the
+    export's identifiers include emails, so the model can match people). Empty on any
+    failure — no synced accounts, missing db, schema drift in a future macOS — and the
+    export then simply has no calendar section.
+
+    Limitation: recurring events are stored as rules, not expanded occurrences, so
+    only one-off events (and individually modified occurrences) appear. Ad-hoc meeting
+    invites — the follow-up case that matters — are one-offs.
+    """
+    db_path = os.path.expanduser(
+        "~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb"
+    )
+    if not os.path.exists(db_path):
+        print(f"# Note: Calendar database not found at {db_path}", file=sys.stderr)
+        return []
+
+    now = datetime.now().timestamp()
+    lo = now - days_back * 86400 - MAC_EPOCH
+    hi = now + days_ahead * 86400 - MAC_EPOCH
+
+    events = []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT ci.ROWID AS rowid, ci.summary AS summary,
+                   ci.start_date AS start, ci.end_date AS end,
+                   ci.all_day AS all_day, c.title AS calendar
+            FROM CalendarItem ci
+            JOIN Calendar c ON ci.calendar_id = c.ROWID
+            WHERE ci.start_date BETWEEN ? AND ?
+              AND ci.summary IS NOT NULL
+              AND IFNULL(ci.status, 0) != 3      -- 3 = event canceled
+            ORDER BY ci.start_date
+        """, (lo, hi)).fetchall()
+
+        # Attendees in one shot. is_self rows are me; status 3 = declined the invite.
+        attendees = {}
+        if rows:
+            placeholders = ",".join("?" for _ in rows)
+            for p in conn.execute(f"""
+                SELECT owner_id, email, status FROM Participant
+                WHERE owner_id IN ({placeholders})
+                  AND IFNULL(is_self, 0) = 0
+                  AND email IS NOT NULL
+            """, [r["rowid"] for r in rows]):
+                label = p["email"] + (" (declined)" if p["status"] == 3 else "")
+                attendees.setdefault(p["owner_id"], []).append(label)
+        conn.close()
+
+        for r in rows:
+            events.append({
+                "ts": r["start"] + MAC_EPOCH,
+                "end_ts": (r["end"] + MAC_EPOCH) if r["end"] is not None else None,
+                "all_day": bool(r["all_day"]),
+                "summary": " ".join((r["summary"] or "").split()),
+                "calendar": r["calendar"],
+                "attendees": attendees.get(r["rowid"], []),
+            })
+    except sqlite3.Error as exc:
+        print(f"# Note: could not read Calendar DB: {exc}", file=sys.stderr)
+        return []
+    return events
+
+
+def render_calendar(events, days_back, days_ahead):
+    """Compact calendar section: one line per event, matching the export's tone."""
+    lines = [f"# Calendar · {days_back}d back to {days_ahead}d ahead · "
+             f"{len(events)} event(s) · from local Apple Calendar"]
+    for ev in events:
+        start = datetime.fromtimestamp(ev["ts"])
+        if ev["all_day"]:
+            when = f"{start:%m-%d %a} all-day"
+        else:
+            when = f"{start:%m-%d %a} {start:%H:%M}"
+            if ev["end_ts"]:
+                end = datetime.fromtimestamp(ev["end_ts"])
+                if end.date() == start.date():
+                    when += f"-{end:%H:%M}"
+        line = f"{when} · {ev['summary']}"
+        if ev["calendar"]:
+            line += f" · cal: {ev['calendar']}"
+        if ev["attendees"]:
+            line += " · with: " + ", ".join(ev["attendees"])
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Markdown rendering
 # --------------------------------------------------------------------------- #
 def render_person(person, last):
@@ -930,6 +1035,11 @@ def main():
         log(f"  {msgs - before_msgs} WhatsApp message(s), "
             f"{reactions - before_reactions} reaction(s)")
 
+    log("Reading Calendar…")
+    cal_days_back, cal_days_ahead = 7, 14
+    cal_events = load_calendar_events(cal_days_back, cal_days_ahead)
+    log(f"  {len(cal_events)} calendar event(s) in window")
+
     log("Merging contacts and applying filters…")
 
     # Fold together the numbers/addresses that belong to one Contacts card, so a person
@@ -972,8 +1082,12 @@ def main():
                    f"{len(persons)} individual conversation(s){quiet_note}.")
 
     out = sys.stdout
+    calendar_section = (render_calendar(cal_events, cal_days_back, cal_days_ahead)
+                        if cal_events else "")
     if args.full:
         out.write(f"<!-- followuper export · {window_note} -->\n\n")
+        if calendar_section:
+            out.write(calendar_section + "\n\n---\n\n")
         for i, person in enumerate(persons):
             if i:
                 out.write("\n---\n\n")
@@ -983,6 +1097,8 @@ def main():
         out.write(f"# followuper export · {window_note} · "
                   f"-> you sent, <- they sent · "
                   f"[you: x]/[them: x] = reaction to that message\n\n")
+        if calendar_section:
+            out.write(calendar_section + "\n\n")
         for person in persons:
             out.write(render_person_compact(person, args.last, args.max_chars))
             out.write("\n\n")

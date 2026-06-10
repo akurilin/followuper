@@ -12,6 +12,10 @@ reading the export) can spot who's waiting on a reply from you. Everything runs 
 Mac against the local message databases — **no cloud APIs, no accounts, no
 dependencies**, just one Python file and the standard library.
 
+**macOS only.** This is not incidental: the whole approach is reading Apple's local
+on-disk databases (Messages, WhatsApp Desktop, Contacts, Calendar), which simply don't
+exist on Windows or Linux. There is no cross-platform mode.
+
 The problem it solves: personal threads quietly fall through the cracks. A friend asks
 a question, you mean to reply later, and three weeks pass. Your conversations are split
 across two apps with no combined view, and neither app will tell you "the ball is in
@@ -35,6 +39,11 @@ prioritized list of who you owe a reply.
 - **One-command AI review.** `./followups.sh` pipes the export straight into Claude
   Code's headless mode (`claude -p`) and returns a prioritized follow-up list — and the
   private message content never touches disk along the way.
+- **Calendar-aware (optional).** If Calendar.app has your accounts synced, the export
+  opens with your actual schedule, so the review can tell a meeting that's really
+  booked from one that's still unconfirmed — instead of flagging "no invite mentioned
+  in the chat" for a meeting that's been on your calendar for days. No Google Cloud
+  project or OAuth setup: it reads the same local store Calendar.app already syncs.
 - **Snooze list with auto-resurfacing.** Ignore people by stable identifier (phone,
   email, WhatsApp JID) with a `since` date. The moment they send something newer than
   that date, they reappear in the report, flagged as resurfaced — no manual pruning.
@@ -48,13 +57,14 @@ prioritized list of who you owe a reply.
 
 ## How it works
 
-`followuper.py` reads three local databases, all read-only:
+`followuper.py` reads four local databases, all read-only:
 
 | Source   | File                                                                            | Used for                      |
 | -------- | ------------------------------------------------------------------------------- | ----------------------------- |
 | iMessage | `~/Library/Messages/chat.db`                                                    | Messages, tapbacks            |
 | WhatsApp | `~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite` | Messages, reactions           |
 | Contacts | `~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb`    | Names, cross-platform merging |
+| Calendar | `~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb`         | Verifying meetings got scheduled (optional) |
 
 It finds the individual (non-group) conversations with any activity in the last *N*
 months, merges the two platforms per person, and prints a dated summary to stdout.
@@ -75,12 +85,37 @@ What gets included:
 - **Names** come from your Contacts and from WhatsApp's stored contact names; unknown
   numbers are shown raw.
 
+### Calendar cross-check (optional)
+
+If Calendar.app on this Mac has any accounts synced (System Settings → Internet
+Accounts — Google, iCloud, Exchange all work), the export opens with a compact
+`# Calendar` section listing your events, including attendee emails so the reviewing
+model can match events to the people in your threads. This kills a whole class of
+false positives: a chat that ends with "I'll send you an invite" looks unresolved on
+its own, but reads as settled once the matching event is visible.
+
+Note the **calendar window is not the message window**: messages go `--months` back,
+while calendar events cover a fixed **7 days back → 14 days ahead**, regardless of
+`--months`. That's intentional — the calendar's job is to verify near-term scheduling
+("did that invite arrive?", "did that meeting already happen?"), not to mirror
+history. Messages can't see the future, and months of past events would be noise.
+
+You never need to *use* Calendar.app: account sync runs in a background daemon, so
+you can add the account, silence the app's notifications, and quit it forever. If no
+calendar database exists, the section is simply omitted and everything else works as
+before.
+
 ## Requirements
 
-- **macOS**, with the Messages app and/or WhatsApp Desktop set up on this machine.
+- **macOS — required, no exceptions.** Every data source is an Apple local database;
+  nothing here works on Windows or Linux.
+- The **Messages app and/or WhatsApp Desktop** set up on this machine.
 - **Python 3** — uses only the standard library, so there's nothing to install.
 - **Full Disk Access** for your terminal (System Settings → Privacy & Security) — macOS
   requires it to read `~/Library/Messages/`.
+- **Accounts synced in Calendar.app** *(optional)* — only for the calendar
+  cross-check. Add your Google/iCloud account under System Settings → Internet
+  Accounts with Calendars enabled; no Google Cloud project or OAuth setup needed.
 - **[Claude Code](https://claude.com/claude-code)** — only if you want the
   `./followups.sh` AI review; the export itself doesn't need it.
 
@@ -279,6 +314,13 @@ comes back to life. To drop someone permanently, just delete their line.
   across platforms relies on a shared phone number or a shared contact card. Someone you
   reach by Apple ID email who is *not* in your Contacts (so the email and their WhatsApp
   phone can't be tied to one card) will appear as a separate section.
+- **Recurring calendar events don't appear.** The local calendar store keeps
+  recurrences as rules rather than expanded occurrences, so the calendar section only
+  shows one-off events (and individually modified occurrences). Ad-hoc meeting
+  invites — the case that matters for follow-ups — are one-offs.
+- **The calendar window is fixed** (7 days back → 14 days ahead). A meeting scheduled
+  in an old thread that happened more than a week ago falls outside it, so the model
+  can't use the calendar to confirm that one took place.
 - Reading `~/Library/Messages/` may require granting your terminal **Full Disk
   Access** in System Settings → Privacy & Security.
 

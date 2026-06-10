@@ -50,6 +50,22 @@ Watch for **the same person split across numbers** — the script merges by Cont
 card, but if two sections are clearly one human, treat them as one and judge the most
 recent thread.
 
+## Cross-check the calendar
+
+The export may open with a `# Calendar` section — my actual schedule (last week
+through the next two weeks), including attendee emails. Use it before flagging
+scheduling threads:
+
+- A conversation negotiating a meeting + a matching calendar event (same person or
+  their email, plausible time) = **booked**. The invite was sent even if the chat
+  never confirms it — don't flag unless something else is genuinely unresolved.
+- A matching event in the **past** = the meeting already happened; judge the thread
+  only on what remains open after it.
+- A concrete agreed plan with **no** matching event = scheduling really is
+  unconfirmed; that is worth flagging.
+- One-off events only: recurring events don't appear, so don't draw conclusions
+  about standing meetings from their absence.
+
 ## Output
 
 Give a **prioritized** list, grouped:
@@ -65,4 +81,6 @@ ball-in-their-court, closed threads) so I can sanity-check. Offer to draft repli
 starting with the most urgent.
 EOF
 
-python3 followuper.py --months 2 --inactive-days 0 "$@" | claude -p "$PROMPT"
+# Opus: tried Sonnet, but Opus's prioritization judgment (what's truly urgent vs
+# noise) was noticeably better and worth the extra cost for a run-occasionally tool.
+python3 followuper.py --months 2 --inactive-days 0 "$@" | claude -p --model opus "$PROMPT"
