@@ -46,6 +46,11 @@ Do **not** flag:
   sticker-only or reaction-only exchanges.
 - Anyone on the ignore list (the script already drops them).
 
+Email threads (source `Mail`, tag `m` on mixed-source people) follow the same rules.
+They are pre-filtered to real correspondents — people I've actually emailed back —
+but still skip anything clearly transactional that slipped through (receipts,
+confirmations, scheduling bots).
+
 Watch for **the same person split across numbers** — the script merges by Contacts
 card, but if two sections are clearly one human, treat them as one and judge the most
 recent thread.

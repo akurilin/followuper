@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-followuper — export 1-on-1 conversations from iMessage + WhatsApp as Markdown.
+followuper — export 1-on-1 conversations from iMessage, WhatsApp + Mail as Markdown.
 
-Reads your local macOS iMessage (chat.db) and WhatsApp Desktop (ChatStorage.sqlite)
-databases STRICTLY READ-ONLY, finds the individual (non-group) conversations that had
-any activity in the last N months, merges the two platforms per person, and prints a
-single Markdown document to stdout (one section per person, every message dated).
-Reactions (iMessage tapbacks, WhatsApp emoji reactions) are attached to the message
-they target, so an acknowledged question reads as acknowledged.
+Reads your local macOS iMessage (chat.db), WhatsApp Desktop (ChatStorage.sqlite) and
+Apple Mail (Envelope Index) databases STRICTLY READ-ONLY, finds the individual
+(non-group) conversations that had any activity in the last N months, merges the
+platforms per person, and prints a single Markdown document to stdout (one section
+per person, every message dated). Reactions (iMessage tapbacks, WhatsApp emoji
+reactions) are attached to the message they target, so an acknowledged question
+reads as acknowledged.
 
 If macOS Calendar.app has accounts synced (Settings → Internet Accounts), the export
 opens with a compact calendar section (last week → next two weeks, read from the
 local Calendar store) so the reviewing model can verify whether discussed meetings
 actually got scheduled instead of flagging them as unconfirmed.
+
+Email is gated on engagement, not inbox membership: automated mail (mailing lists,
+anything with an unsubscribe header, Mail's own automated-thread flag) is dropped in
+SQL, and an incoming sender appears only if you've EVER emailed them back (or they're
+in Contacts). Cold outreach and newsletters never get replies, so they filter
+themselves out.
 
 No third-party dependencies — only the Python standard library (sqlite3).
 
@@ -20,6 +27,7 @@ Usage:
     python3 followuper.py --months 3 > conversations.md
     python3 followuper.py --months 6 > conversations.md   # wider window
     python3 followuper.py --months 3 --source imessage    # restrict to one platform
+    python3 followuper.py --months 3 --source mail        # email threads only
     python3 followuper.py --months 3 --last 25            # show 25 messages/person
     python3 followuper.py --months 3 --last 0             # all messages in window
     python3 followuper.py --months 3 --inactive-days 14   # only threads quiet 2+ weeks
@@ -44,7 +52,10 @@ SELECT statements and never writes to, copies over, or alters the original files
 """
 
 import argparse
+import email
+import email.policy
 import glob
+import html
 import json
 import os
 import platform
@@ -776,6 +787,204 @@ def collect_whatsapp(people, cutoff_epoch):
 
 
 # --------------------------------------------------------------------------- #
+# Mail collection (local Apple Mail store)
+# --------------------------------------------------------------------------- #
+# Cap each email body snippet: a full email would dwarf the chat messages in the
+# export, and the first few hundred characters carry the ask/answer.
+MAIL_BODY_CHARS = 400
+
+
+def load_my_addresses():
+    """My own email addresses, from the system Accounts store (read-only).
+
+    Direction (sent vs received) must be decided by sender address: Gmail keeps
+    sent mail inside All Mail, and Mail.app's local Sent mailboxes can sit empty
+    (e.g. mid-sync), so "is this message from me" can't rely on which mailbox a
+    row lives in. Empty set on any failure — mail collection then skips itself.
+    """
+    path = os.path.expanduser("~/Library/Accounts/Accounts4.sqlite")
+    addresses = set()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        for (username,) in conn.execute(
+                "SELECT DISTINCT ZUSERNAME FROM ZACCOUNT WHERE ZUSERNAME LIKE '%@%'"):
+            addresses.add(username.strip().lower())
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"# Note: could not read Accounts DB: {exc}", file=sys.stderr)
+    return addresses
+
+
+def read_emlx_body(path):
+    """Extract a compact one-line snippet from one .emlx message file.
+
+    An .emlx is a byte-count line, the raw RFC 822 message, then an Apple plist
+    trailer. Only the part of the body the sender actually wrote is kept:
+    reading stops at the first quoted-reply marker ('>' line or 'On ... wrote:')
+    or signature delimiter, since everything below re-quotes the thread the
+    export already shows. HTML-only mail is crudely de-tagged. None on any
+    parse failure — the caller falls back to the subject line.
+    """
+    try:
+        with open(path, "rb") as fh:
+            size = int(fh.readline().strip())
+            msg = email.message_from_bytes(fh.read(size), policy=email.policy.default)
+        part = msg.get_body(preferencelist=("plain", "html"))
+        if part is None:
+            return None
+        text = part.get_content()
+        if part.get_content_type() == "text/html":
+            text = re.sub(r"(?is)<(style|script).*?</\1>", " ", text)
+            text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+        kept = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if (stripped.startswith(">") or stripped == "--"
+                    or re.match(r"On .+ wrote:$", stripped)):
+                break
+            kept.append(line)
+        text = " ".join(" ".join(kept).split())
+        if len(text) > MAIL_BODY_CHARS:
+            text = text[:MAIL_BODY_CHARS].rstrip() + "…"
+        return text or None
+    except Exception:
+        return None
+
+
+def collect_mail(people, cutoff_epoch, email_to_name):
+    """Read 1-on-1 email threads from the local Apple Mail store (read-only).
+
+    Mail.app syncs every account into one Envelope Index database — the same
+    no-auth local-mirror trick as chat.db and the calendar. What gets in:
+
+    - Automated mail is dropped in SQL using Mail's own classifiers: anything
+      with a mailing-list id or unsubscribe header, or flagged as an
+      automated conversation.
+    - Engagement gate: an incoming message counts only if I've EVER sent that
+      person an email (i.e. they appear as a recipient of my outgoing mail) or
+      they're in Contacts. Senders I never replied to are cold outreach/noise.
+    - 1-on-1 only, mirroring the chat sources: incoming must be addressed to
+      just me; outgoing must have exactly one recipient besides me.
+
+    Bodies come from .emlx files (named by messages.ROWID) when Mail has
+    downloaded them; otherwise the subject alone stands in. Envelope Index
+    timestamps are plain unix epoch — no Apple-epoch offset.
+    """
+    env_paths = sorted(glob.glob(os.path.expanduser(
+        "~/Library/Mail/V*/MailData/Envelope Index")))
+    if not env_paths:
+        print("# Note: no local Mail store found (~/Library/Mail)", file=sys.stderr)
+        return
+    my_addresses = load_my_addresses()
+    if not my_addresses:
+        print("# Note: no account addresses found — skipping Mail (can't tell "
+              "sent from received)", file=sys.stderr)
+        return
+
+    mail_root = os.path.dirname(os.path.dirname(env_paths[-1]))  # .../Mail/V10
+    conn = sqlite3.connect(f"file:{env_paths[-1]}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+
+    my_ph = ",".join("?" for _ in my_addresses)
+    my_params = sorted(my_addresses)
+
+    # Everyone I've ever written to — the engagement gate for incoming mail.
+    # Deliberately unbounded by the export window: a reply from years ago still
+    # proves the correspondent is real.
+    replied_to = {r[0] for r in conn.execute(f"""
+        SELECT DISTINCT lower(ra.address)
+        FROM messages m
+        JOIN addresses sa ON m.sender = sa.ROWID
+        JOIN recipients r ON r.message = m.ROWID
+        JOIN addresses ra ON r.address = ra.ROWID
+        WHERE lower(sa.address) IN ({my_ph})
+    """, my_params)}
+
+    # Recipients per in-window message (needed for direction + the 1-on-1 check).
+    recipients = {}
+    for row in conn.execute("""
+        SELECT r.message AS msg, lower(ra.address) AS addr, ra.comment AS name
+        FROM recipients r
+        JOIN messages m ON r.message = m.ROWID
+        JOIN addresses ra ON r.address = ra.ROWID
+        WHERE COALESCE(m.date_received, m.date_sent) >= CAST(? AS INTEGER)
+    """, [cutoff_epoch]):
+        recipients.setdefault(row["msg"], {}).setdefault(row["addr"], row["name"])
+
+    # Bodies live as <messages.ROWID>.emlx files under the account directories.
+    emlx_paths = {}
+    for path in glob.glob(os.path.join(mail_root, "**", "*.emlx"), recursive=True):
+        stem = os.path.basename(path).split(".")[0]
+        if stem.isdigit():
+            emlx_paths[int(stem)] = path
+
+    rows = conn.execute("""
+        SELECT m.ROWID AS rowid, m.global_message_id AS gid,
+               lower(sa.address) AS sender, sa.comment AS sender_name,
+               s.subject AS subject,
+               COALESCE(m.date_received, m.date_sent) AS ts
+        FROM messages m
+        JOIN addresses sa ON m.sender = sa.ROWID
+        JOIN subjects s ON m.subject = s.ROWID
+        JOIN mailboxes b ON m.mailbox = b.ROWID
+        WHERE COALESCE(m.date_received, m.date_sent) >= CAST(? AS INTEGER)
+          AND m.deleted = 0
+          AND IFNULL(m.list_id_hash, 0) = 0
+          AND IFNULL(m.unsubscribe_type, 0) = 0
+          AND IFNULL(m.automated_conversation, 0) = 0
+          AND b.url NOT LIKE '%Trash%' AND b.url NOT LIKE '%Spam%'
+          AND b.url NOT LIKE '%Junk%' AND b.url NOT LIKE '%Drafts%'
+        ORDER BY ts
+    """, [cutoff_epoch])
+
+    seen = set()  # global_message_id — Gmail can mirror one message in two mailboxes
+    for row in rows:
+        if row["gid"] in seen:
+            continue
+        seen.add(row["gid"])
+
+        sender = row["sender"] or ""
+        is_from_me = sender in my_addresses
+        others = {a: n for a, n in recipients.get(row["rowid"], {}).items()
+                  if a not in my_addresses}
+
+        if is_from_me:
+            if len(others) != 1:
+                continue              # mass mail / group thread / note-to-self
+            addr, contact_name = next(iter(others.items()))
+        else:
+            if others:
+                continue              # they wrote to me AND others: group thread
+            if sender not in replied_to and sender not in email_to_name:
+                continue              # never engaged: cold outreach / noise
+            addr, contact_name = sender, row["sender_name"]
+
+        subject = " ".join((row["subject"] or "").split())
+        body = (read_emlx_body(emlx_paths[row["rowid"]])
+                if row["rowid"] in emlx_paths else None)
+        if subject and body:
+            text = f"[{subject}] {body}"
+        else:
+            text = body or (f"[{subject}]" if subject else None)
+        if not text:
+            continue
+
+        key = ("email", addr)
+        person = people.setdefault(key, Person(key))
+        person.identifiers.add(addr)
+        person.sources.add("Mail")
+        person.add_name(email_to_name.get(addr) or (contact_name or "").strip(), "Mail")
+        person.messages.append({
+            "ts": row["ts"],
+            "source": "Mail",
+            "is_from_me": is_from_me,
+            "text": text,
+        })
+
+    conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # Calendar (local Apple Calendar store)
 # --------------------------------------------------------------------------- #
 def load_calendar_events(days_back=7, days_ahead=14):
@@ -919,9 +1128,11 @@ def render_person_compact(person, last, max_chars):
     """Token-lean rendering: one line per message, no repeated name/date/markdown.
 
     Direction is a single arrow (-> you sent, <- they sent), the date is printed once
-    per day, and only the time prefixes each line. For people on both platforms an
-    'i'/'w' tag marks each message's source; otherwise the source lives in the header.
+    per day, and only the time prefixes each line. For people on several platforms an
+    'i'/'w'/'m' tag marks each message's source; otherwise the source lives in the
+    header.
     """
+    source_tags = {"iMessage": "i ", "WhatsApp": "w ", "Mail": "m "}
     messages = sorted(person.messages, key=lambda m: m["ts"])
     if last:
         messages = messages[-last:]
@@ -946,7 +1157,7 @@ def render_person_compact(person, last, max_chars):
             lines.append(day)
             current_day = day
         arrow = "->" if msg["is_from_me"] else "<-"
-        tag = ("i " if msg["source"] == "iMessage" else "w ") if multi_source else ""
+        tag = source_tags[msg["source"]] if multi_source else ""
         reactions = "".join(f" [{'you' if r['from_me'] else 'them'}: {r['emoji']}]"
                             for r in msg.get("reactions", []))
         lines.append(f"{dt:%H:%M} {arrow} {tag}{squeeze_body(msg['text'], max_chars)}"
@@ -1053,6 +1264,29 @@ def run_doctor(ignore_path):
         report("–", "Contacts", "no AddressBook database — names and cross-number "
                                 "merging will be degraded (optional)")
 
+    mail_paths = sorted(glob.glob(os.path.expanduser(
+        "~/Library/Mail/V*/MailData/Envelope Index")))
+    mail_status = _probe_sqlite(mail_paths[-1])[0] if mail_paths else "missing"
+    if mail_status == "ok":
+        my_addresses = load_my_addresses()
+        if my_addresses:
+            try:
+                conn = sqlite3.connect(f"file:{mail_paths[-1]}?mode=ro", uri=True)
+                n = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                conn.close()
+                report("✓", "Mail", f"{n} message(s), "
+                                    f"{len(my_addresses)} account address(es)")
+            except sqlite3.Error as exc:
+                report("–", "Mail", f"found but unreadable ({exc}) — email threads "
+                                    "will be skipped")
+        else:
+            report("–", "Mail", "Envelope Index readable but no account addresses "
+                                "in Accounts4.sqlite — mail skipped (can't tell "
+                                "sent from received)")
+    else:
+        report("–", "Mail", "no local Mail store (optional) — add your accounts to "
+                            "Mail.app and let it sync to include email threads")
+
     cal_path = os.path.expanduser(
         "~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb")
     status, detail = _probe_sqlite(cal_path)
@@ -1105,8 +1339,11 @@ def main():
     )
     parser.add_argument("--months", type=int, default=3,
                         help="How many months back to include (default: 3).")
-    parser.add_argument("--source", choices=["both", "imessage", "whatsapp"],
-                        default="both", help="Which platform(s) to read (default: both).")
+    parser.add_argument("--source",
+                        choices=["all", "imessage", "whatsapp", "mail", "both"],
+                        default="all",
+                        help="Which source(s) to read (default: all). 'both' is the "
+                             "legacy alias for the two chat apps, without mail.")
     parser.add_argument("--min-messages", type=int, default=1,
                         help="Skip people with fewer than this many messages in the window.")
     parser.add_argument("--inactive-days", type=int, default=7,
@@ -1169,18 +1406,24 @@ def main():
                     for m in p.messages))
 
     people = {}
-    if args.source in ("both", "imessage"):
+    if args.source in ("all", "both", "imessage"):
         log("Reading iMessage…")
         collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name)
         msgs, reactions = counts(people)
         log(f"  {msgs} message(s), {reactions} reaction(s) so far")
-    if args.source in ("both", "whatsapp"):
+    if args.source in ("all", "both", "whatsapp"):
         before_msgs, before_reactions = counts(people)
         log("Reading WhatsApp…")
         collect_whatsapp(people, cutoff_epoch)
         msgs, reactions = counts(people)
         log(f"  {msgs - before_msgs} WhatsApp message(s), "
             f"{reactions - before_reactions} reaction(s)")
+    if args.source in ("all", "mail"):
+        before_msgs, _ = counts(people)
+        log("Reading Mail…")
+        collect_mail(people, cutoff_epoch, email_to_name)
+        msgs, _ = counts(people)
+        log(f"  {msgs - before_msgs} mail message(s)")
 
     log("Reading Calendar…")
     cal_days_back, cal_days_ahead = 7, 14
@@ -1243,7 +1486,8 @@ def main():
     else:
         out.write(f"# followuper export · {window_note} · "
                   f"-> you sent, <- they sent · "
-                  f"[you: x]/[them: x] = reaction to that message\n\n")
+                  f"[you: x]/[them: x] = reaction to that message · "
+                  f"i/w/m = iMessage/WhatsApp/Mail on mixed-source people\n\n")
         if calendar_section:
             out.write(calendar_section + "\n\n")
         for person in persons:

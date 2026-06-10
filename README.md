@@ -6,11 +6,11 @@
 [![macOS](https://img.shields.io/badge/macOS-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](followuper.py)
 
-`followuper` is a local-first CLI that exports your one-on-one **iMessage** and
-**WhatsApp** conversations into a single merged, per-person report, so you (or an AI
-reading the export) can spot who's waiting on a reply from you. Everything runs on your
-Mac against the local message databases — **no cloud APIs, no accounts, no
-dependencies**, just one Python file and the standard library.
+`followuper` is a local-first CLI that exports your one-on-one **iMessage**,
+**WhatsApp**, and **email** conversations into a single merged, per-person report, so
+you (or an AI reading the export) can spot who's waiting on a reply from you.
+Everything runs on your Mac against the local message databases — **no cloud APIs, no
+accounts, no dependencies**, just one Python file and the standard library.
 
 **macOS only.** This is not incidental: the whole approach is reading Apple's local
 on-disk databases (Messages, WhatsApp Desktop, Contacts, Calendar), which simply don't
@@ -39,6 +39,12 @@ prioritized list of who you owe a reply.
 - **One-command AI review.** `./followups.sh` pipes the export straight into Claude
   Code's headless mode (`claude -p`) and returns a prioritized follow-up list — and the
   private message content never touches disk along the way.
+- **Email, gated on engagement (optional).** If Mail.app has your accounts synced, your
+  1-on-1 email threads join the report — but only with people you've actually
+  corresponded with. Mailing lists, anything with an unsubscribe header, and Mail's own
+  automated-thread detections are dropped in SQL, and an incoming sender only appears
+  if you've ever emailed them back (or they're in your Contacts). Cold outreach and
+  newsletters never get replies, so they filter themselves out.
 - **Calendar-aware (optional).** If Calendar.app has your accounts synced, the export
   opens with your actual schedule, so the review can tell a meeting that's really
   booked from one that's still unconfirmed — instead of flagging "no invite mentioned
@@ -63,6 +69,7 @@ prioritized list of who you owe a reply.
 | -------- | ------------------------------------------------------------------------------- | ----------------------------- |
 | iMessage | `~/Library/Messages/chat.db`                                                    | Messages, tapbacks            |
 | WhatsApp | `~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite` | Messages, reactions           |
+| Mail     | `~/Library/Mail/V*/MailData/Envelope Index` (+ `.emlx` files, `Accounts4.sqlite`) | Email threads with real correspondents (optional) |
 | Contacts | `~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb`    | Names, cross-platform merging |
 | Calendar | `~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb`         | Verifying meetings got scheduled (optional) |
 
@@ -84,6 +91,30 @@ What gets included:
   section — a person you text on two numbers is one thread, not two.
 - **Names** come from your Contacts and from WhatsApp's stored contact names; unknown
   numbers are shown raw.
+
+### Email threads (optional)
+
+If Mail.app has accounts synced, individual email threads join the export, tagged
+`Mail` (or `m` on people who also text you). Email needs a stricter filter than chat —
+an inbox is mostly machines — so inclusion is **gated on engagement**:
+
+- **Automated mail is dropped first**, using Mail's own classifiers stored right in the
+  Envelope Index: mailing-list ids, unsubscribe headers, and detected automated
+  conversations, plus anything in Trash/Spam/Drafts.
+- **An incoming sender appears only if you've *ever* sent them an email** — any
+  recipient of your outgoing mail, however old, counts — **or they're in Contacts.**
+  Senders you never replied to are cold outreach and never reach the report.
+- **1-on-1 only**, mirroring the chat sources: incoming mail must be addressed to just
+  you, outgoing mail to exactly one person.
+
+Message bodies are read from Mail's downloaded `.emlx` files, trimmed of quoted reply
+chains and signatures, and capped at 400 characters — the export needs the ask, not
+the whole thread re-quoted. If a body hasn't been downloaded yet (Mail syncs the index
+before the content), the subject line stands in.
+
+Your own addresses (needed to tell sent from received) are read from the system
+Accounts database, since Gmail keeps sent mail inside All Mail rather than a separate
+local mailbox.
 
 ### Calendar cross-check (optional)
 
@@ -116,6 +147,8 @@ before.
 - **Accounts synced in Calendar.app** *(optional)* — only for the calendar
   cross-check. Add your Google/iCloud account under System Settings → Internet
   Accounts with Calendars enabled; no Google Cloud project or OAuth setup needed.
+- **Accounts synced in Mail.app** *(optional)* — only for email threads. Same idea:
+  add the account, let Mail sync, and the script reads the local store.
 - **[Claude Code](https://claude.com/claude-code)** — only if you want the
   `./followups.sh` AI review; the export itself doesn't need it.
 
@@ -135,7 +168,7 @@ python3 followuper.py --months 3 > conversations.md
 ./followups.sh
 ```
 
-`--doctor` verifies each data source (iMessage, WhatsApp, Contacts, Calendar), the
+`--doctor` verifies each data source (iMessage, WhatsApp, Mail, Contacts, Calendar), the
 ignore file, and the `claude` CLI, printing the exact fix for anything broken — it's
 the fastest way to find out you're missing Full Disk Access. It prints counts only,
 never message content.
@@ -146,9 +179,11 @@ never message content.
 # Verbose, human-readable Markdown instead of the compact format:
 python3 followuper.py --months 3 --full
 
-# Only one platform:
+# Only one source:
 python3 followuper.py --months 3 --source imessage
 python3 followuper.py --months 3 --source whatsapp
+python3 followuper.py --months 3 --source mail
+python3 followuper.py --months 3 --source both     # the two chat apps, no mail
 
 # Skip thin conversations (fewer than 5 messages in the window):
 python3 followuper.py --months 3 --min-messages 5
@@ -175,7 +210,7 @@ python3 followuper.py --doctor
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `--months N` | `3` | How many months back to include. |
-| `--source` | `both` | `both`, `imessage`, or `whatsapp`. |
+| `--source` | `all` | `all`, `imessage`, `whatsapp`, `mail`, or `both` (the two chat apps, no mail). |
 | `--min-messages N` | `1` | Drop people with fewer than N messages in the window. |
 | `--inactive-days N` | `7` | Only include threads with no activity in the last N days; fresher ones are skipped. `0` includes everything. |
 | `--last N` | `10` | Show only the most recent N messages per person; `0` for all. |
@@ -326,6 +361,13 @@ comes back to life. To drop someone permanently, just delete their line.
   across platforms relies on a shared phone number or a shared contact card. Someone you
   reach by Apple ID email who is *not* in your Contacts (so the email and their WhatsApp
   phone can't be tied to one card) will appear as a separate section.
+- **Email bodies lag the index.** Mail downloads the Envelope Index before message
+  content, so on a fresh sync some emails appear with just their subject line until
+  the `.emlx` files arrive.
+- **A real correspondent's first-ever email can be filtered.** The engagement gate
+  requires that you've emailed the sender before (or that they're in Contacts), so a
+  genuinely new person whose intro you haven't answered won't surface until you reply
+  once or add them to Contacts.
 - **Recurring calendar events don't appear.** The local calendar store keeps
   recurrences as rules rather than expanded occurrences, so the calendar section only
   shows one-off events (and individually modified occurrences). Ad-hoc meeting
