@@ -88,6 +88,9 @@ dominates the size:
 - direction is a single arrow (`->` you sent, `<-` they sent);
 - the date appears once per day, with just `HH:MM` per message;
 - URLs collapse to a `[domain]` marker;
+- reactions (iMessage tapbacks, WhatsApp emoji reactions) are appended to the
+  message they target as `[you: 👍]` / `[them: 👍]`, so a question that was
+  acknowledged with a reaction doesn't read as ignored;
 - `--max-chars` optionally caps long pasted messages.
 
 ```
@@ -95,7 +98,7 @@ dominates the size:
 iMessage · +15550000001 · 29 msgs · last: them 06-06 14:23
 05-18
 16:39 <- Good luck tomorrow!
-16:51 -> Thank you, I pushed it back a week to prep more.
+16:51 -> Thank you, I pushed it back a week to prep more. [them: ❤️]
 05-23
 16:46 <- Totally understand. Rooting for you.
 ```
@@ -110,7 +113,8 @@ the document states the arrow convention so the model doesn't have to guess.
 A more readable per-person section: resolved name, platforms, identifiers, a message
 count, and the last-message time, followed by the conversation. Messages from both
 platforms are interleaved in chronological order and tagged with their source.
-Messages you sent are labelled `Me`.
+Messages you sent are labelled `Me`; reactions appear on their own line under the
+message they target (e.g. `Reactions: Me 👍`).
 
 ```markdown
 # Jordan Lee

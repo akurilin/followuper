@@ -31,6 +31,9 @@ A conversation needs a follow-up when the ball is in **my** court:
 
 - **They sent the last message** and it warrants a reply (a question, a plan,
   something left open). A reaction/sticker/emoji-only last message usually does not.
+- Reactions are marked inline as `[you: 👍]` / `[them: 👍]` on the message they
+  target. A reaction usually counts as an acknowledgment — a question I 👍'd or
+  they 👍'd is typically settled, not ignored.
 - **I made a commitment** I haven't delivered (an intro, materials, "I'll send X").
 - **An open loop went quiet** — a plan never finalized, or a "let's reconnect when
   I'm back / soon" that's now overdue.

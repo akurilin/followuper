@@ -6,6 +6,8 @@ Reads your local macOS iMessage (chat.db) and WhatsApp Desktop (ChatStorage.sqli
 databases STRICTLY READ-ONLY, finds the individual (non-group) conversations that had
 any activity in the last N months, merges the two platforms per person, and prints a
 single Markdown document to stdout (one section per person, every message dated).
+Reactions (iMessage tapbacks, WhatsApp emoji reactions) are attached to the message
+they target, so an acknowledged question reads as acknowledged.
 
 No third-party dependencies — only the Python standard library (sqlite3).
 
@@ -433,6 +435,12 @@ def merge_by_contact(persons, token_to_record):
 # --------------------------------------------------------------------------- #
 # iMessage collection
 # --------------------------------------------------------------------------- #
+# Standard tapback kinds, keyed by associated_message_type % 1000 (2000s add a
+# tapback, 3000s remove one). Kind 6 is a custom emoji tapback, whose emoji lives
+# in the associated_message_emoji column instead.
+TAPBACK_EMOJI = {0: "❤️", 1: "👍", 2: "👎", 3: "😂", 4: "‼️", 5: "❓"}
+
+
 def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     chat_db = os.path.expanduser("~/Library/Messages/chat.db")
     if not os.path.exists(chat_db):
@@ -481,6 +489,7 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     placeholders = ",".join("?" for _ in individual_chats)
     query = f"""
         SELECT cmj.chat_id AS chat_id,
+               m.guid AS guid,
                m.date AS date,
                m.is_from_me AS is_from_me,
                m.text AS text,
@@ -495,6 +504,7 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     """
     params = list(individual_chats.keys()) + [cutoff_epoch]
 
+    by_guid = {}  # message guid -> message dict, for attaching tapbacks below
     for row in conn.execute(query, params):
         identifier = individual_chats[row["chat_id"]]
         ts = row["date"] / 1_000_000_000 + MAC_EPOCH
@@ -515,12 +525,46 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
         person.identifiers.add(identifier)
         person.sources.add("iMessage")
         person.add_name(resolve(identifier), "iMessage")
-        person.messages.append({
+        message = {
             "ts": ts,
             "source": "iMessage",
             "is_from_me": bool(row["is_from_me"]),
             "text": text,
-        })
+        }
+        person.messages.append(message)
+        by_guid[row["guid"]] = message
+
+    # Second pass: tapbacks. They are stored as separate message rows pointing at
+    # their target via associated_message_guid ("p:0/GUID" or "bp:GUID"). A tapback
+    # always postdates its target, so the same date cutoff cannot miss one whose
+    # target is in the window. Processed in date order so a removal (3000s) or a
+    # changed tapback lands after the add it supersedes.
+    reaction_query = f"""
+        SELECT m.associated_message_guid AS target,
+               m.associated_message_type AS rtype,
+               m.associated_message_emoji AS emoji,
+               m.is_from_me AS is_from_me
+        FROM chat_message_join cmj
+        JOIN message m ON cmj.message_id = m.ROWID
+        WHERE cmj.chat_id IN ({placeholders})
+          AND m.associated_message_type BETWEEN 2000 AND 3999
+          AND (m.date / 1000000000 + {MAC_EPOCH}) >= CAST(? AS INTEGER)
+        ORDER BY m.date
+    """
+    for row in conn.execute(reaction_query, params):
+        guid = (row["target"] or "").split("/")[-1].split(":")[-1]
+        message = by_guid.get(guid)
+        if message is None:
+            continue
+        emoji = TAPBACK_EMOJI.get(row["rtype"] % 1000) or clean_text(row["emoji"])
+        if not emoji:
+            continue
+        from_me = bool(row["is_from_me"])
+        reactions = message.setdefault("reactions", [])
+        # One tapback per sender: an add replaces that sender's previous one.
+        reactions[:] = [r for r in reactions if r["from_me"] != from_me]
+        if row["rtype"] < 3000:
+            reactions.append({"from_me": from_me, "emoji": emoji})
 
     conn.close()
 
@@ -529,6 +573,92 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
 # WhatsApp collection
 # --------------------------------------------------------------------------- #
 WA_MEDIA_LABELS = {1: "[image]", 2: "[video]", 3: "[audio]", 10: "[sticker]", 14: "[deleted message]"}
+
+
+def pb_fields(data):
+    """Iterate (field_number, wire_type, value) over one protobuf message.
+
+    Minimal decoder for WhatsApp's ZRECEIPTINFO blob: varints come back as ints,
+    length-delimited fields as raw bytes, fixed32/64 skipped. Malformed input
+    raises (IndexError/ValueError) — callers treat that as "no reactions here".
+    """
+    pos = 0
+    while pos < len(data):
+        key = 0
+        shift = 0
+        while True:
+            byte = data[pos]
+            pos += 1
+            key |= (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                break
+        field, wire = key >> 3, key & 7
+        if wire == 0:
+            value = 0
+            shift = 0
+            while True:
+                byte = data[pos]
+                pos += 1
+                value |= (byte & 0x7F) << shift
+                shift += 7
+                if not byte & 0x80:
+                    break
+        elif wire == 2:
+            length = 0
+            shift = 0
+            while True:
+                byte = data[pos]
+                pos += 1
+                length |= (byte & 0x7F) << shift
+                shift += 7
+                if not byte & 0x80:
+                    break
+            value = data[pos:pos + length]
+            pos += length
+        elif wire == 1:
+            value = data[pos:pos + 8]
+            pos += 8
+        elif wire == 5:
+            value = data[pos:pos + 4]
+            pos += 4
+        else:
+            raise ValueError(f"unsupported wire type {wire}")
+        yield field, wire, value
+
+
+def wa_reactions(blob):
+    """Pull reactions out of a ZWAMESSAGEINFO.ZRECEIPTINFO blob.
+
+    The blob is a protobuf where repeated field 7 carries one reaction per
+    reactor, as a nested message (field 1) of {2: sender JID, 3: emoji,
+    4: timestamp ms}. The sender JID is ABSENT when the reaction is our own.
+    A changed reaction appears as a newer entry for the same sender and a removed
+    one as an empty emoji, so keep each sender's latest entry and drop empties.
+
+    Returns a list of (from_me, emoji).
+    """
+    latest = {}  # sender jid bytes (None = me) -> (ts, emoji)
+    try:
+        for field, wire, value in pb_fields(bytes(blob)):
+            if field != 7 or wire != 2:
+                continue
+            for f1, w1, entry in pb_fields(value):
+                if f1 != 1 or w1 != 2:
+                    continue
+                sender, emoji, ts = None, None, 0
+                for f2, w2, v2 in pb_fields(entry):
+                    if f2 == 2 and w2 == 2:
+                        sender = bytes(v2)
+                    elif f2 == 3 and w2 == 2:
+                        emoji = v2.decode("utf-8", errors="replace")
+                    elif f2 == 4 and w2 == 0:
+                        ts = v2
+                if emoji is not None and ts >= latest.get(sender, (-1, ""))[0]:
+                    latest[sender] = (ts, emoji)
+    except (IndexError, ValueError):
+        return []
+    return [(sender is None, emoji) for sender, (_, emoji) in latest.items() if emoji]
 
 
 def collect_whatsapp(people, cutoff_epoch):
@@ -554,7 +684,8 @@ def collect_whatsapp(people, cutoff_epoch):
         pass
 
     query = f"""
-        SELECT s.ZCONTACTJID AS jid,
+        SELECT m.Z_PK AS pk,
+               s.ZCONTACTJID AS jid,
                s.ZPARTNERNAME AS partner,
                s.ZCONTACTIDENTIFIER AS alt_id,
                m.ZMESSAGEDATE AS date,
@@ -571,6 +702,7 @@ def collect_whatsapp(people, cutoff_epoch):
         ORDER BY m.ZMESSAGEDATE
     """
 
+    by_pk = {}  # ZWAMESSAGE.Z_PK -> message dict, for attaching reactions below
     for row in conn.execute(query, [cutoff_epoch]):
         jid = row["jid"] or ""
         mtype = row["mtype"]
@@ -600,12 +732,37 @@ def collect_whatsapp(people, cutoff_epoch):
         person.identifiers.add(jid)
         person.sources.add("WhatsApp")
         person.add_name(row["partner"] or push_names.get(jid) or jid, "WhatsApp")
-        person.messages.append({
+        message = {
             "ts": ts,
             "source": "WhatsApp",
             "is_from_me": bool(row["is_from_me"]),
             "text": text,
-        })
+        }
+        person.messages.append(message)
+        by_pk[row["pk"]] = message
+
+    # Second pass: reactions. They are not message rows — each message's
+    # ZWAMESSAGEINFO.ZRECEIPTINFO protobuf carries the current reactions on it.
+    # In a 1-on-1 chat the reactor is either us (no sender JID in the blob) or
+    # the contact, so no JID matching is needed.
+    info_query = f"""
+        SELECT i.ZMESSAGE AS pk, i.ZRECEIPTINFO AS blob
+        FROM ZWAMESSAGEINFO i
+        JOIN ZWAMESSAGE m ON i.ZMESSAGE = m.Z_PK
+        JOIN ZWACHATSESSION s ON m.ZCHATSESSION = s.Z_PK
+        WHERE s.ZGROUPINFO IS NULL
+          AND s.ZSESSIONTYPE = 0
+          AND s.ZCONTACTJID NOT LIKE '%@status'
+          AND i.ZRECEIPTINFO IS NOT NULL
+          AND (m.ZMESSAGEDATE + {MAC_EPOCH}) >= CAST(? AS INTEGER)
+    """
+    for row in conn.execute(info_query, [cutoff_epoch]):
+        message = by_pk.get(row["pk"])
+        if message is None:
+            continue
+        for from_me, emoji in wa_reactions(row["blob"]):
+            message.setdefault("reactions", []).append(
+                {"from_me": from_me, "emoji": emoji})
 
     conn.close()
 
@@ -641,6 +798,10 @@ def render_person(person, last):
         # Preserve multi-line message bodies under the header line.
         for textline in msg["text"].splitlines() or [""]:
             lines.append(textline)
+        if msg.get("reactions"):
+            lines.append("*Reactions: " + ", ".join(
+                f"{ME_LABEL if r['from_me'] else name} {r['emoji']}"
+                for r in msg["reactions"]) + "*")
         lines.append("")
 
     return "\n".join(lines)
@@ -678,7 +839,10 @@ def render_person_compact(person, last, max_chars):
             current_day = day
         arrow = "->" if msg["is_from_me"] else "<-"
         tag = ("i " if msg["source"] == "iMessage" else "w ") if multi_source else ""
-        lines.append(f"{dt:%H:%M} {arrow} {tag}{squeeze_body(msg['text'], max_chars)}")
+        reactions = "".join(f" [{'you' if r['from_me'] else 'them'}: {r['emoji']}]"
+                            for r in msg.get("reactions", []))
+        lines.append(f"{dt:%H:%M} {arrow} {tag}{squeeze_body(msg['text'], max_chars)}"
+                     f"{reactions}")
 
     return "\n".join(lines)
 
@@ -747,16 +911,24 @@ def main():
     phone_to_name, email_to_name, token_to_record = load_contacts()
     log(f"  {len(phone_to_name)} phone + {len(email_to_name)} email name(s) from Contacts")
 
+    def counts(people):
+        return (sum(len(p.messages) for p in people.values()),
+                sum(len(m.get("reactions", ())) for p in people.values()
+                    for m in p.messages))
+
     people = {}
     if args.source in ("both", "imessage"):
         log("Reading iMessage…")
         collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name)
-        log(f"  {sum(len(p.messages) for p in people.values())} message(s) so far")
+        msgs, reactions = counts(people)
+        log(f"  {msgs} message(s), {reactions} reaction(s) so far")
     if args.source in ("both", "whatsapp"):
-        before = sum(len(p.messages) for p in people.values())
+        before_msgs, before_reactions = counts(people)
         log("Reading WhatsApp…")
         collect_whatsapp(people, cutoff_epoch)
-        log(f"  {sum(len(p.messages) for p in people.values()) - before} WhatsApp message(s)")
+        msgs, reactions = counts(people)
+        log(f"  {msgs - before_msgs} WhatsApp message(s), "
+            f"{reactions - before_reactions} reaction(s)")
 
     log("Merging contacts and applying filters…")
 
@@ -809,7 +981,8 @@ def main():
             out.write("\n")
     else:
         out.write(f"# followuper export · {window_note} · "
-                  f"-> you sent, <- they sent\n\n")
+                  f"-> you sent, <- they sent · "
+                  f"[you: x]/[them: x] = reaction to that message\n\n")
         for person in persons:
             out.write(render_person_compact(person, args.last, args.max_chars))
             out.write("\n\n")
