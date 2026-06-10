@@ -29,6 +29,7 @@ Usage:
     python3 followuper.py --months 3 --full              # verbose Markdown instead
     python3 followuper.py --ignore                       # add someone to the ignore list
     python3 followuper.py --ignore "Diana"               # ...pre-filling the name search
+    python3 followuper.py --doctor                       # check data sources & permissions
 
 Output defaults to a token-lean format (one line per message) meant for feeding to an
 AI. Pass --full for the verbose, human-readable Markdown instead.
@@ -46,7 +47,9 @@ import argparse
 import glob
 import json
 import os
+import platform
 import re
+import shutil
 import sqlite3
 import sys
 from datetime import datetime, timedelta
@@ -957,6 +960,143 @@ def render_person_compact(person, last, max_chars):
 
 
 # --------------------------------------------------------------------------- #
+# Doctor (environment self-check)
+# --------------------------------------------------------------------------- #
+def _probe_sqlite(path):
+    """Classify access to one sqlite store: 'ok', 'missing', 'noaccess', or 'error'.
+
+    The subtlety: when macOS TCC blocks a protected directory (no Full Disk Access),
+    os.path.exists() returns False — indistinguishable from the file genuinely not
+    being there. Probing the parent directory tells the two apart: a permission error
+    there means "blocked", a clean listing (or absent parent) means "not set up".
+    """
+    if not os.path.exists(path):
+        try:
+            os.listdir(os.path.dirname(path))
+            return "missing", None
+        except PermissionError:
+            return "noaccess", None
+        except OSError:
+            return "missing", None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        conn.close()
+        return "ok", None
+    except sqlite3.Error as exc:
+        return "error", str(exc)
+
+
+def run_doctor(ignore_path):
+    """Check every data source and dependency; print one ✓/✗/– line each, with the
+    exact fix for anything broken. Prints counts only — never content.
+
+    Returns the process exit code: 0 when the tool can do useful work (at least one
+    message source readable), 1 otherwise. Optional pieces (Contacts, Calendar,
+    ignore file, claude CLI) never fail the check — they show as '–' with a pointer.
+    """
+    FDA_FIX = ("grant Full Disk Access to your terminal app (System Settings → "
+               "Privacy & Security → Full Disk Access), then restart the terminal")
+
+    def report(mark, name, detail):
+        print(f"{mark} {name:<11} {detail}")
+
+    if sys.platform != "darwin":
+        report("✗", "macOS", f"this is '{sys.platform}' — followuper only works on "
+                             "macOS; it reads Apple's local databases")
+        return 1
+    report("✓", "macOS", platform.mac_ver()[0])
+
+    # --- message sources (at least one required) --------------------------- #
+    sources_ok = 0
+
+    status, detail = _probe_sqlite(os.path.expanduser("~/Library/Messages/chat.db"))
+    if status == "ok":
+        sources_ok += 1
+        report("✓", "iMessage", "chat.db readable")
+    elif status == "noaccess":
+        report("✗", "iMessage", "blocked by macOS — " + FDA_FIX)
+    elif status == "missing":
+        report("✗", "iMessage", "chat.db not found — sign into Messages on this Mac")
+    else:
+        report("✗", "iMessage", f"unreadable ({detail}) — likely fix: " + FDA_FIX)
+
+    status, detail = _probe_sqlite(os.path.expanduser(
+        "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"))
+    if status == "ok":
+        sources_ok += 1
+        report("✓", "WhatsApp", "ChatStorage.sqlite readable")
+    elif status == "missing":
+        report("✗", "WhatsApp", "database not found — install WhatsApp Desktop and "
+                                "link it to your phone")
+    else:
+        report("✗", "WhatsApp", f"unreadable ({detail or 'permission denied'})")
+
+    # --- optional sources --------------------------------------------------- #
+    contacts = glob.glob(os.path.expanduser(
+        "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"))
+    if contacts:
+        status, detail = _probe_sqlite(contacts[0])
+        if status == "ok":
+            try:
+                conn = sqlite3.connect(f"file:{contacts[0]}?mode=ro", uri=True)
+                n = conn.execute("SELECT COUNT(*) FROM ZABCDRECORD").fetchone()[0]
+                conn.close()
+                report("✓", "Contacts", f"{n} contact card(s)")
+            except sqlite3.Error as exc:
+                report("–", "Contacts", f"found but unreadable ({exc}) — names and "
+                                        "cross-number merging will be degraded")
+        else:
+            report("–", "Contacts", "found but unreadable — names and cross-number "
+                                    "merging will be degraded")
+    else:
+        report("–", "Contacts", "no AddressBook database — names and cross-number "
+                                "merging will be degraded (optional)")
+
+    cal_path = os.path.expanduser(
+        "~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb")
+    status, detail = _probe_sqlite(cal_path)
+    if status == "ok":
+        events = load_calendar_events()
+        report("✓", "Calendar", f"{len(events)} event(s) in the review window")
+    else:
+        report("–", "Calendar", "no synced calendars (optional) — System Settings → "
+                                "Internet Accounts → add your account with Calendars "
+                                "enabled; the review then verifies meetings got booked")
+
+    # --- config + review dependency ----------------------------------------- #
+    ignore_broken = False
+    if os.path.exists(ignore_path):
+        try:
+            entries = load_ignore_list(ignore_path)
+            report("✓", "ignore file", f"{len(entries)} entr(y/ies) in "
+                                       f"{os.path.basename(ignore_path)}")
+        except (ValueError, KeyError) as exc:
+            # Not optional once present: the export loads this file and would crash.
+            ignore_broken = True
+            report("✗", "ignore file", f"{os.path.basename(ignore_path)} is invalid "
+                                       f"({exc}) — fix or delete it")
+    else:
+        report("–", "ignore file", "none yet (optional) — create one with --ignore")
+
+    claude_path = shutil.which("claude")
+    if claude_path:
+        report("✓", "claude CLI", claude_path)
+    else:
+        report("–", "claude CLI", "not found (optional) — needed only for "
+                                  "./followups.sh; install Claude Code")
+
+    if sources_ok and not ignore_broken:
+        print(f"\nReady: {sources_ok} message source(s) available.")
+        return 0
+    if ignore_broken:
+        print("\nNot ready: the ignore file is invalid and would crash the export.")
+    else:
+        print("\nNot ready: no readable message source (need iMessage or WhatsApp).")
+    return 1
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def main():
@@ -988,6 +1128,11 @@ def main():
                              "exporting: searches Contacts, lists matches (with all "
                              "their numbers), and snoozes the one you pick. Pass a name "
                              "to pre-fill the search, or bare --ignore to be prompted.")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Check the environment instead of exporting: verifies "
+                             "each data source is present and readable and prints "
+                             "the exact fix for anything broken (Full Disk Access, "
+                             "missing apps, unsynced calendar).")
     parser.add_argument("--full", action="store_true",
                         help="Verbose, human-readable Markdown instead of the default "
                              "token-lean compact format.")
@@ -996,7 +1141,9 @@ def main():
                              "characters (default: 0 = no truncation).")
     args = parser.parse_args()
 
-    # --ignore is a maintenance mode, not an export: add a person and stop.
+    # Maintenance modes, not exports: do the one thing and stop.
+    if args.doctor:
+        sys.exit(run_doctor(args.ignore_file))
     if args.ignore is not None:
         add_to_ignore(args.ignore_file, args.ignore)
         return

@@ -125,12 +125,20 @@ before.
 git clone https://github.com/akurilin/followuper.git
 cd followuper
 
+# First, check that everything on this Mac is set up and readable:
+python3 followuper.py --doctor
+
 # Last 3 months, compact output to stdout (redirect to save it):
 python3 followuper.py --months 3 > conversations.md
 
 # Or go straight to the AI review — export + prioritized follow-up list:
 ./followups.sh
 ```
+
+`--doctor` verifies each data source (iMessage, WhatsApp, Contacts, Calendar), the
+ignore file, and the `claude` CLI, printing the exact fix for anything broken — it's
+the fastest way to find out you're missing Full Disk Access. It prints counts only,
+never message content.
 
 ## Usage
 
@@ -157,6 +165,9 @@ python3 followuper.py --months 3 --max-chars 300
 
 # Use a custom ignore list:
 python3 followuper.py --months 3 --ignore-file mine.json
+
+# Check data sources and permissions without exporting anything:
+python3 followuper.py --doctor
 ```
 
 ### Options
@@ -170,6 +181,7 @@ python3 followuper.py --months 3 --ignore-file mine.json
 | `--last N` | `10` | Show only the most recent N messages per person; `0` for all. |
 | `--ignore-file PATH` | `ignore.json` | People to skip (see below). Defaults to `ignore.json` next to the script. |
 | `--ignore [NAME]` | — | Maintenance mode: search Contacts by name and add the person you pick to the ignore file (instead of exporting). See below. |
+| `--doctor` | — | Maintenance mode: check every data source and dependency, print ✓/✗ with the exact fix for anything broken, and exit (0 = ready). |
 | `--full` | off | Verbose Markdown instead of the default compact format. |
 | `--max-chars N` | `0` | Truncate each message to N chars; `0` = no limit. |
 
