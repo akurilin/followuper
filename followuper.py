@@ -63,7 +63,9 @@ import re
 import shutil
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from collections.abc import Iterator
+from datetime import date, datetime, timedelta
+from typing import NotRequired, TypedDict
 
 # Apple Core Data epoch offset: seconds between 1970-01-01 and 2001-01-01.
 MAC_EPOCH = 978307200
@@ -73,9 +75,51 @@ ME_LABEL = "Me"
 
 
 # --------------------------------------------------------------------------- #
+# Shared data shapes
+# --------------------------------------------------------------------------- #
+# A person's merge key is a (kind, value) tuple, e.g. ("phone", "2065551234"),
+# ("email", "a@b.com"), or ("contact", <record id>). The same key from more than
+# one source folds into a single merged person.
+PersonKey = tuple[str, str | int]
+
+
+class Reaction(TypedDict):
+    from_me: bool
+    emoji: str
+
+
+class Message(TypedDict):
+    ts: float
+    source: str
+    is_from_me: bool
+    text: str
+    reactions: NotRequired[list[Reaction]]   # attached lazily, only when present
+
+
+class CalendarEvent(TypedDict):
+    ts: float
+    end_ts: float | None
+    all_day: bool
+    summary: str
+    calendar: str | None
+    attendees: list[str]
+
+
+class IgnoreEntry(TypedDict):
+    token: str
+    name: str
+    since: date
+
+
+class ContactCard(TypedDict):
+    name: str
+    identifiers: list[str]
+
+
+# --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
-def log(message):
+def log(message: str) -> None:
     """Print a progress line to stderr.
 
     Progress goes to stderr, never stdout: stdout is the data stream (it may be
@@ -86,7 +130,7 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
-def months_ago_epoch(months):
+def months_ago_epoch(months: int) -> tuple[int, datetime]:
     """Return the unix timestamp `months` calendar months before now (local)."""
     now = datetime.now()
     month_index = (now.year * 12 + (now.month - 1)) - months
@@ -98,13 +142,13 @@ def months_ago_epoch(months):
     return int(cutoff.timestamp()), cutoff
 
 
-def normalize_phone(number):
+def normalize_phone(number: str | None) -> str:
     """Reduce any phone string to its last 10 digits for cross-source matching."""
     digits = re.sub(r"\D", "", number or "")
     return digits[-10:] if len(digits) >= 10 else digits
 
 
-def id_token(value):
+def id_token(value: str | None) -> str:
     """Canonical, comparable form of an identifier (phone / email / WhatsApp JID).
 
     Phones reduce to their last 10 digits, so the same person matches whether they
@@ -123,14 +167,14 @@ def id_token(value):
     return digits[-10:] if len(digits) >= 10 else v
 
 
-def looks_like_name(value):
+def looks_like_name(value: str | None) -> bool:
     """True if the string looks like a human name rather than a raw phone/JID."""
     if not value:
         return False
     return bool(re.search(r"[A-Za-z]", value)) and "@" not in value
 
 
-def load_ignore_list(path):
+def load_ignore_list(path: str) -> list[IgnoreEntry]:
     """Load the ignore file into a list of entries.
 
     The file is a JSON object keyed by a stable identifier (phone / email / WhatsApp
@@ -144,7 +188,7 @@ def load_ignore_list(path):
         return []
     with open(path, encoding="utf-8") as fh:
         raw = json.load(fh)
-    entries = []
+    entries: list[IgnoreEntry] = []
     for key, value in raw.items():
         since = value["since"] if isinstance(value, dict) else value
         entries.append({
@@ -155,7 +199,7 @@ def load_ignore_list(path):
     return entries
 
 
-def ignore_since_date(person, entries):
+def ignore_since_date(person: "Person", entries: list[IgnoreEntry]) -> date | None:
     """If this person is on the ignore list, return their snooze date, else None.
 
     Matches primarily on identifier token (phone/email/JID), which is stable. Falls
@@ -172,7 +216,7 @@ def ignore_since_date(person, entries):
     return None
 
 
-def clean_text(text):
+def clean_text(text: str | None) -> str | None:
     """Trim Apple typedstream trailing garbage (null bytes / replacement chars)."""
     if not text:
         return text
@@ -183,15 +227,15 @@ def clean_text(text):
     return text.strip()
 
 
-def shorten_urls(text):
+def shorten_urls(text: str) -> str:
     """Replace full URLs with a [domain] marker — the tracking path is dead weight."""
-    def repl(match):
+    def repl(match: re.Match[str]) -> str:
         domain = re.sub(r"^https?://(www\.)?", "", match.group(0)).split("/")[0]
         return f"[{domain}]"
     return re.sub(r"https?://\S+", repl, text)
 
 
-def squeeze_body(text, max_chars):
+def squeeze_body(text: str, max_chars: int) -> str:
     """Collapse a message to a single compact line, shortening URLs and trimming length."""
     text = " ".join(shorten_urls(text).split())
     if max_chars and len(text) > max_chars:
@@ -202,7 +246,7 @@ def squeeze_body(text, max_chars):
 # --------------------------------------------------------------------------- #
 # iMessage typedstream text extraction
 # --------------------------------------------------------------------------- #
-def extract_text_from_typedstream(blob):
+def extract_text_from_typedstream(blob: bytes | None) -> str | None:
     """Pull the message body out of message.attributedBody (Apple typedstream)."""
     if not blob:
         return None
@@ -239,19 +283,19 @@ def extract_text_from_typedstream(blob):
 class Person:
     """Merged conversation for one individual across both platforms."""
 
-    def __init__(self, key):
+    def __init__(self, key: PersonKey) -> None:
         self.key = key
-        self.name_candidates = []   # list of (name, source) in discovery order
-        self.identifiers = set()    # raw phone/email/jid strings seen
-        self.sources = set()        # {"iMessage", "WhatsApp"}
-        self.messages = []          # list of dicts: ts, source, is_from_me, text
+        self.name_candidates: list[tuple[str, str]] = []  # (name, source), discovery order
+        self.identifiers: set[str] = set()    # raw phone/email/jid strings seen
+        self.sources: set[str] = set()        # {"iMessage", "WhatsApp", "Mail"}
+        self.messages: list[Message] = []
         self.resurfaced = False     # was ignored, but came back with a newer message
 
-    def add_name(self, name, source):
+    def add_name(self, name: str | None, source: str) -> None:
         if name and name not in [n for n, _ in self.name_candidates]:
             self.name_candidates.append((name, source))
 
-    def absorb(self, other):
+    def absorb(self, other: "Person") -> None:
         """Fold another Person — the same human on a different number/address — in."""
         self.identifiers |= other.identifiers
         self.sources |= other.sources
@@ -260,7 +304,7 @@ class Person:
             self.add_name(name, source)
 
     @property
-    def display_name(self):
+    def display_name(self) -> str:
         # Prefer a real (alphabetic) name; otherwise fall back to first identifier.
         for name, _ in self.name_candidates:
             if looks_like_name(name):
@@ -270,14 +314,14 @@ class Person:
         return next(iter(self.identifiers), "Unknown")
 
     @property
-    def last_ts(self):
+    def last_ts(self) -> float:
         return max((m["ts"] for m in self.messages), default=0)
 
 
 # --------------------------------------------------------------------------- #
 # Contacts (name resolution + cross-number identity)
 # --------------------------------------------------------------------------- #
-def load_contacts():
+def load_contacts() -> tuple[dict[str, str], dict[str, str], dict[str, int]]:
     """Read the macOS AddressBook (best-effort, read-only).
 
     Returns three maps:
@@ -290,7 +334,9 @@ def load_contacts():
     person map to the same record and can be folded into one conversation. All maps are
     empty if the AddressBook can't be found or read.
     """
-    phone_to_name, email_to_name, token_to_record = {}, {}, {}
+    phone_to_name: dict[str, str] = {}
+    email_to_name: dict[str, str] = {}
+    token_to_record: dict[str, int] = {}
     sources = glob.glob(os.path.expanduser(
         "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
     ))
@@ -326,7 +372,14 @@ def load_contacts():
     return phone_to_name, email_to_name, token_to_record
 
 
-def load_contact_cards():
+class _CardAccum(TypedDict):
+    # Accumulator while gathering a card's identifiers; the identifiers start as a
+    # set (dedupe) and become a sorted list in the returned ContactCard.
+    name: str
+    identifiers: set[str]
+
+
+def load_contact_cards() -> list[ContactCard]:
     """Read Contacts grouped by person, for the `--ignore` picker (read-only).
 
     Returns a list of {"name", "identifiers"} — one entry per address-book card that
@@ -341,16 +394,17 @@ def load_contact_cards():
     if not sources:
         return []
 
-    def card_name(first, last, nick, org):
+    def card_name(first: str | None, last: str | None,
+                  nick: str | None, org: str | None) -> str:
         return (f"{first or ''} {last or ''}".strip() or nick or org or "")
 
-    def clean_identifier(value):
+    def clean_identifier(value: str | None) -> str:
         # Phones keep only digits and a leading +; emails lowercase. The ignore list
         # matches on the last 10 digits regardless, so this is just for a tidy file.
         v = (value or "").strip()
         return v.lower() if "@" in v else re.sub(r"[^\d+]", "", v)
 
-    cards = {}  # record Z_PK -> {"name", "identifiers": set}
+    cards: dict[int, _CardAccum] = {}  # record Z_PK -> accumulator
     try:
         conn = sqlite3.connect(f"file:{sources[0]}?mode=ro", uri=True)
         for table, column in (("ZABCDPHONENUMBER", "ZFULLNUMBER"),
@@ -371,13 +425,15 @@ def load_contact_cards():
         print(f"# Note: could not read Contacts DB: {exc}", file=sys.stderr)
         return []
 
-    result = [{"name": c["name"], "identifiers": sorted(c["identifiers"])}
-              for c in cards.values() if c["name"] and c["identifiers"]]
+    result: list[ContactCard] = [
+        {"name": c["name"], "identifiers": sorted(c["identifiers"])}
+        for c in cards.values() if c["name"] and c["identifiers"]
+    ]
     result.sort(key=lambda c: c["name"].lower())
     return result
 
 
-def add_to_ignore(ignore_path, initial_query=""):
+def add_to_ignore(ignore_path: str, initial_query: str = "") -> None:
     """Interactive picker: search Contacts by name and snooze the person you pick.
 
     Writes every identifier on the chosen card into `ignore_path` with today's date,
@@ -389,7 +445,7 @@ def add_to_ignore(ignore_path, initial_query=""):
         log("No Contacts found to search — add identifiers to the ignore file by hand.")
         return
 
-    data = {}
+    data: dict[str, object] = {}
     if os.path.exists(ignore_path):
         with open(ignore_path, encoding="utf-8") as fh:
             text = fh.read().strip()
@@ -426,7 +482,8 @@ def add_to_ignore(ignore_path, initial_query=""):
               f"— added to {os.path.basename(ignore_path)}")
 
 
-def merge_by_contact(persons, token_to_record):
+def merge_by_contact(persons: list["Person"],
+                     token_to_record: dict[str, int]) -> list["Person"]:
     """Collapse Person fragments that belong to one Contacts card into one conversation.
 
     Someone with two phone numbers (or a phone and an email) on a single card is one
@@ -434,10 +491,10 @@ def merge_by_contact(persons, token_to_record):
     in Contacts — or whose card can't be matched — is left exactly as-is, keyed by their
     own identifier. Discovery order is preserved so later sorting is unaffected.
     """
-    merged = {}
-    order = []
+    merged: dict[PersonKey, Person] = {}
+    order: list[PersonKey] = []
     for person in persons:
-        record = None
+        record: int | None = None
         for ident in person.identifiers:
             record = token_to_record.get(id_token(ident))
             if record is not None:
@@ -460,7 +517,9 @@ def merge_by_contact(persons, token_to_record):
 TAPBACK_EMOJI = {0: "❤️", 1: "👍", 2: "👎", 3: "😂", 4: "‼️", 5: "❓"}
 
 
-def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
+def collect_imessage(people: dict[PersonKey, "Person"], cutoff_epoch: int,
+                     phone_to_name: dict[str, str],
+                     email_to_name: dict[str, str]) -> None:
     chat_db = os.path.expanduser("~/Library/Messages/chat.db")
     if not os.path.exists(chat_db):
         print(f"# Note: iMessage database not found at {chat_db}", file=sys.stderr)
@@ -469,7 +528,7 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     conn = sqlite3.connect(f"file:{chat_db}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
 
-    def resolve(identifier):
+    def resolve(identifier: str | None) -> str | None:
         if not identifier:
             return identifier
         if "@" in identifier:
@@ -480,7 +539,7 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     # and not an automated sender. We drop SMS short codes (<=6 all-digit identifiers
     # like 39781 or 346637) and toll-free numbers — these are businesses/automations
     # (T-Mobile, Resy, Partiful, ...), never people to follow up with.
-    individual_chats = {}  # chat ROWID -> chat_identifier
+    individual_chats: dict[int, str] = {}  # chat ROWID -> chat_identifier
     for row in conn.execute("""
         SELECT c.ROWID AS rowid, c.chat_identifier AS ident
         FROM chat c
@@ -523,7 +582,7 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     """
     params = list(individual_chats.keys()) + [cutoff_epoch]
 
-    by_guid = {}  # message guid -> message dict, for attaching tapbacks below
+    by_guid: dict[str, Message] = {}  # message guid -> message, for attaching tapbacks
     for row in conn.execute(query, params):
         identifier = individual_chats[row["chat_id"]]
         ts = row["date"] / 1_000_000_000 + MAC_EPOCH
@@ -544,7 +603,7 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
         person.identifiers.add(identifier)
         person.sources.add("iMessage")
         person.add_name(resolve(identifier), "iMessage")
-        message = {
+        message: Message = {
             "ts": ts,
             "source": "iMessage",
             "is_from_me": bool(row["is_from_me"]),
@@ -572,14 +631,14 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
     """
     for row in conn.execute(reaction_query, params):
         guid = (row["target"] or "").split("/")[-1].split(":")[-1]
-        message = by_guid.get(guid)
-        if message is None:
+        target = by_guid.get(guid)
+        if target is None:
             continue
         emoji = TAPBACK_EMOJI.get(row["rtype"] % 1000) or clean_text(row["emoji"])
         if not emoji:
             continue
         from_me = bool(row["is_from_me"])
-        reactions = message.setdefault("reactions", [])
+        reactions = target.setdefault("reactions", [])
         # One tapback per sender: an add replaces that sender's previous one.
         reactions[:] = [r for r in reactions if r["from_me"] != from_me]
         if row["rtype"] < 3000:
@@ -594,7 +653,7 @@ def collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name):
 WA_MEDIA_LABELS = {1: "[image]", 2: "[video]", 3: "[audio]", 10: "[sticker]", 14: "[deleted message]"}
 
 
-def pb_fields(data):
+def pb_fields(data: bytes) -> Iterator[tuple[int, int, int | bytes]]:
     """Iterate (field_number, wire_type, value) over one protobuf message.
 
     Minimal decoder for WhatsApp's ZRECEIPTINFO blob: varints come back as ints,
@@ -613,6 +672,7 @@ def pb_fields(data):
             if not byte & 0x80:
                 break
         field, wire = key >> 3, key & 7
+        value: int | bytes
         if wire == 0:
             value = 0
             shift = 0
@@ -646,7 +706,7 @@ def pb_fields(data):
         yield field, wire, value
 
 
-def wa_reactions(blob):
+def wa_reactions(blob: bytes) -> list[tuple[bool, str]]:
     """Pull reactions out of a ZWAMESSAGEINFO.ZRECEIPTINFO blob.
 
     The blob is a protobuf where repeated field 7 carries one reaction per
@@ -657,21 +717,25 @@ def wa_reactions(blob):
 
     Returns a list of (from_me, emoji).
     """
-    latest = {}  # sender jid bytes (None = me) -> (ts, emoji)
+    latest: dict[bytes | None, tuple[int, str]] = {}  # sender jid (None=me) -> (ts, emoji)
     try:
         for field, wire, value in pb_fields(bytes(blob)):
-            if field != 7 or wire != 2:
+            if field != 7 or wire != 2 or not isinstance(value, bytes):
                 continue
             for f1, w1, entry in pb_fields(value):
-                if f1 != 1 or w1 != 2:
+                if f1 != 1 or w1 != 2 or not isinstance(entry, bytes):
                     continue
-                sender, emoji, ts = None, None, 0
+                sender: bytes | None = None
+                emoji: str | None = None
+                ts = 0
                 for f2, w2, v2 in pb_fields(entry):
-                    if f2 == 2 and w2 == 2:
-                        sender = bytes(v2)
-                    elif f2 == 3 and w2 == 2:
+                    # wire type 2 yields bytes, wire type 0 yields an int; the
+                    # isinstance checks both pick the field and satisfy the types.
+                    if f2 == 2 and isinstance(v2, bytes):
+                        sender = v2
+                    elif f2 == 3 and isinstance(v2, bytes):
                         emoji = v2.decode("utf-8", errors="replace")
-                    elif f2 == 4 and w2 == 0:
+                    elif f2 == 4 and isinstance(v2, int):
                         ts = v2
                 if emoji is not None and ts >= latest.get(sender, (-1, ""))[0]:
                     latest[sender] = (ts, emoji)
@@ -680,7 +744,7 @@ def wa_reactions(blob):
     return [(sender is None, emoji) for sender, (_, emoji) in latest.items() if emoji]
 
 
-def collect_whatsapp(people, cutoff_epoch):
+def collect_whatsapp(people: dict[PersonKey, "Person"], cutoff_epoch: int) -> None:
     db_path = os.path.expanduser(
         "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"
     )
@@ -692,7 +756,7 @@ def collect_whatsapp(people, cutoff_epoch):
     conn.row_factory = sqlite3.Row
 
     # Fallback display names from self-set push names.
-    push_names = {}
+    push_names: dict[str, str] = {}
     try:
         for row in conn.execute("""
             SELECT ZJID, ZPUSHNAME FROM ZWAPROFILEPUSHNAME
@@ -721,7 +785,7 @@ def collect_whatsapp(people, cutoff_epoch):
         ORDER BY m.ZMESSAGEDATE
     """
 
-    by_pk = {}  # ZWAMESSAGE.Z_PK -> message dict, for attaching reactions below
+    by_pk: dict[int, Message] = {}  # ZWAMESSAGE.Z_PK -> message, for attaching reactions
     for row in conn.execute(query, [cutoff_epoch]):
         jid = row["jid"] or ""
         mtype = row["mtype"]
@@ -751,7 +815,7 @@ def collect_whatsapp(people, cutoff_epoch):
         person.identifiers.add(jid)
         person.sources.add("WhatsApp")
         person.add_name(row["partner"] or push_names.get(jid) or jid, "WhatsApp")
-        message = {
+        message: Message = {
             "ts": ts,
             "source": "WhatsApp",
             "is_from_me": bool(row["is_from_me"]),
@@ -776,11 +840,11 @@ def collect_whatsapp(people, cutoff_epoch):
           AND (m.ZMESSAGEDATE + {MAC_EPOCH}) >= CAST(? AS INTEGER)
     """
     for row in conn.execute(info_query, [cutoff_epoch]):
-        message = by_pk.get(row["pk"])
-        if message is None:
+        target = by_pk.get(row["pk"])
+        if target is None:
             continue
         for from_me, emoji in wa_reactions(row["blob"]):
-            message.setdefault("reactions", []).append(
+            target.setdefault("reactions", []).append(
                 {"from_me": from_me, "emoji": emoji})
 
     conn.close()
@@ -794,7 +858,7 @@ def collect_whatsapp(people, cutoff_epoch):
 MAIL_BODY_CHARS = 400
 
 
-def load_my_addresses():
+def load_my_addresses() -> set[str]:
     """My own email addresses, from the system Accounts store (read-only).
 
     Direction (sent vs received) must be decided by sender address: Gmail keeps
@@ -803,7 +867,7 @@ def load_my_addresses():
     row lives in. Empty set on any failure — mail collection then skips itself.
     """
     path = os.path.expanduser("~/Library/Accounts/Accounts4.sqlite")
-    addresses = set()
+    addresses: set[str] = set()
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         for (username,) in conn.execute(
@@ -815,7 +879,7 @@ def load_my_addresses():
     return addresses
 
 
-def read_emlx_body(path):
+def read_emlx_body(path: str) -> str | None:
     """Extract a compact one-line snippet from one .emlx message file.
 
     An .emlx is a byte-count line, the raw RFC 822 message, then an Apple plist
@@ -836,7 +900,7 @@ def read_emlx_body(path):
         if part.get_content_type() == "text/html":
             text = re.sub(r"(?is)<(style|script).*?</\1>", " ", text)
             text = html.unescape(re.sub(r"<[^>]+>", " ", text))
-        kept = []
+        kept: list[str] = []
         for line in text.splitlines():
             stripped = line.strip()
             if (stripped.startswith(">") or stripped == "--"
@@ -851,7 +915,8 @@ def read_emlx_body(path):
         return None
 
 
-def collect_mail(people, cutoff_epoch, email_to_name):
+def collect_mail(people: dict[PersonKey, "Person"], cutoff_epoch: int,
+                 email_to_name: dict[str, str]) -> None:
     """Read 1-on-1 email threads from the local Apple Mail store (read-only).
 
     Mail.app syncs every account into one Envelope Index database — the same
@@ -905,7 +970,7 @@ def collect_mail(people, cutoff_epoch, email_to_name):
     """, my_params)}
 
     # Recipients per in-window message (needed for direction + the 1-on-1 check).
-    recipients = {}
+    recipients: dict[int, dict[str, str | None]] = {}
     for row in conn.execute("""
         SELECT r.message AS msg, lower(ra.address) AS addr, ra.comment AS name
         FROM recipients r
@@ -916,7 +981,7 @@ def collect_mail(people, cutoff_epoch, email_to_name):
         recipients.setdefault(row["msg"], {}).setdefault(row["addr"], row["name"])
 
     # Bodies live as <messages.ROWID>.emlx files under the account directories.
-    emlx_paths = {}
+    emlx_paths: dict[int, str] = {}
     for path in glob.glob(os.path.join(mail_root, "**", "*.emlx"), recursive=True):
         stem = os.path.basename(path).split(".")[0]
         if stem.isdigit():
@@ -943,9 +1008,9 @@ def collect_mail(people, cutoff_epoch, email_to_name):
           AND b.url NOT LIKE '%Trash%' AND b.url NOT LIKE '%Spam%'
           AND b.url NOT LIKE '%Junk%' AND b.url NOT LIKE '%Drafts%'
         ORDER BY ts
-    """, [cutoff_epoch] + my_params)
+    """, [cutoff_epoch, *my_params])
 
-    seen = set()  # global_message_id — Gmail can mirror one message in two mailboxes
+    seen: set[int] = set()  # global_message_id — Gmail can mirror a message in two boxes
     skipped_group = 0
     for row in rows:
         if row["gid"] in seen:
@@ -975,6 +1040,7 @@ def collect_mail(people, cutoff_epoch, email_to_name):
         subject = " ".join((row["subject"] or "").split())
         body = (read_emlx_body(emlx_paths[row["rowid"]])
                 if row["rowid"] in emlx_paths else None)
+        text: str | None
         if subject and body:
             text = f"[{subject}] {body}"
         else:
@@ -1007,7 +1073,7 @@ def collect_mail(people, cutoff_epoch, email_to_name):
 # --------------------------------------------------------------------------- #
 # Calendar (local Apple Calendar store)
 # --------------------------------------------------------------------------- #
-def load_calendar_events(days_back=7, days_ahead=14):
+def load_calendar_events(days_back: int = 7, days_ahead: int = 14) -> list[CalendarEvent]:
     """Read events around now from the local Apple Calendar store (read-only).
 
     macOS Calendar.app syncs Google/iCloud/Exchange accounts into this database via a
@@ -1036,7 +1102,7 @@ def load_calendar_events(days_back=7, days_ahead=14):
     lo = now - days_back * 86400 - MAC_EPOCH
     hi = now + days_ahead * 86400 - MAC_EPOCH
 
-    events = []
+    events: list[CalendarEvent] = []
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
@@ -1053,7 +1119,7 @@ def load_calendar_events(days_back=7, days_ahead=14):
         """, (lo, hi)).fetchall()
 
         # Attendees in one shot. is_self rows are me; status 3 = declined the invite.
-        attendees = {}
+        attendees: dict[int, list[str]] = {}
         if rows:
             placeholders = ",".join("?" for _ in rows)
             for p in conn.execute(f"""
@@ -1081,7 +1147,7 @@ def load_calendar_events(days_back=7, days_ahead=14):
     return events
 
 
-def render_calendar(events, days_back, days_ahead):
+def render_calendar(events: list[CalendarEvent], days_back: int, days_ahead: int) -> str:
     """Compact calendar section: one line per event, matching the export's tone."""
     lines = [f"# Calendar · {days_back}d back to {days_ahead}d ahead · "
              f"{len(events)} event(s) · from local Apple Calendar"]
@@ -1107,13 +1173,13 @@ def render_calendar(events, days_back, days_ahead):
 # --------------------------------------------------------------------------- #
 # Markdown rendering
 # --------------------------------------------------------------------------- #
-def render_person(person, last):
+def render_person(person: "Person", last: int) -> str:
     # Keep only the most recent `last` messages (last == 0 means all of them).
     messages = sorted(person.messages, key=lambda m: m["ts"])
     if last:
         messages = messages[-last:]
 
-    lines = []
+    lines: list[str] = []
     name = person.display_name
     lines.append(f"# {name}")
     lines.append("")
@@ -1144,7 +1210,7 @@ def render_person(person, last):
     return "\n".join(lines)
 
 
-def render_person_compact(person, last, max_chars):
+def render_person_compact(person: "Person", last: int, max_chars: int) -> str:
     """Token-lean rendering: one line per message, no repeated name/date/markdown.
 
     Direction is a single arrow (-> you sent, <- they sent), the date is printed once
@@ -1169,7 +1235,7 @@ def render_person_compact(person, last, max_chars):
                  f"{', '.join(sorted(person.identifiers))} · "
                  f"{len(person.messages)} msgs · last: {who_last} {last_when}")
 
-    current_day = None
+    current_day: str | None = None
     for msg in messages:
         dt = datetime.fromtimestamp(msg["ts"])
         day = dt.strftime("%m-%d")
@@ -1186,14 +1252,10 @@ def render_person_compact(person, last, max_chars):
     return "\n".join(lines)
 
 
-# A person's merge key is a (kind, value) tuple, e.g. ("phone", "2065551234")
-# or ("email", "a@b.com"). Same key on both platforms => one merged person.
-
-
 # --------------------------------------------------------------------------- #
 # Doctor (environment self-check)
 # --------------------------------------------------------------------------- #
-def _probe_sqlite(path):
+def _probe_sqlite(path: str) -> tuple[str, str | None]:
     """Classify access to one sqlite store: 'ok', 'missing', 'noaccess', or 'error'.
 
     The subtlety: when macOS TCC blocks a protected directory (no Full Disk Access),
@@ -1218,7 +1280,7 @@ def _probe_sqlite(path):
         return "error", str(exc)
 
 
-def run_doctor(ignore_path):
+def run_doctor(ignore_path: str) -> int:
     """Check every data source and dependency; print one ✓/✗/– line each, with the
     exact fix for anything broken. Prints counts only — never content.
 
@@ -1229,7 +1291,7 @@ def run_doctor(ignore_path):
     FDA_FIX = ("grant Full Disk Access to your terminal app (System Settings → "
                "Privacy & Security → Full Disk Access), then restart the terminal")
 
-    def report(mark, name, detail):
+    def report(mark: str, name: str, detail: str) -> None:
         print(f"{mark} {name:<11} {detail}")
 
     if sys.platform != "darwin":
@@ -1353,7 +1415,7 @@ def run_doctor(ignore_path):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export individual iMessage + WhatsApp conversations as Markdown."
     )
@@ -1420,12 +1482,12 @@ def main():
     phone_to_name, email_to_name, token_to_record = load_contacts()
     log(f"  {len(phone_to_name)} phone + {len(email_to_name)} email name(s) from Contacts")
 
-    def counts(people):
+    def counts(people: dict[PersonKey, Person]) -> tuple[int, int]:
         return (sum(len(p.messages) for p in people.values()),
                 sum(len(m.get("reactions", ())) for p in people.values()
                     for m in p.messages))
 
-    people = {}
+    people: dict[PersonKey, Person] = {}
     if args.source in ("all", "both", "imessage"):
         log("Reading iMessage…")
         collect_imessage(people, cutoff_epoch, phone_to_name, email_to_name)
@@ -1472,7 +1534,7 @@ def main():
     # Apply the ignore list. A snoozed person is hidden unless their most recent
     # message is dated after the snooze date — in which case they reappear, flagged.
     ignore = load_ignore_list(args.ignore_file)
-    kept = []
+    kept: list[Person] = []
     for person in persons:
         since = ignore_since_date(person, ignore)
         if since is None:
