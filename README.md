@@ -74,6 +74,7 @@ clean report while you watch progress in the terminal.
 | `--inactive-days N` | `7` | Only include threads with no activity in the last N days; fresher ones are skipped. `0` includes everything. |
 | `--last N` | `10` | Show only the most recent N messages per person; `0` for all. |
 | `--ignore-file PATH` | `ignore.json` | People to skip (see below). Defaults to `ignore.json` next to the script. |
+| `--ignore [NAME]` | — | Maintenance mode: search Contacts by name and add the person you pick to the ignore file (instead of exporting). See below. |
 | `--full` | off | Verbose Markdown instead of the default compact format. |
 | `--max-chars N` | `0` | Truncate each message to N chars; `0` = no limit. |
 
@@ -149,6 +150,22 @@ name, display names can contain emoji, etc.). Phone numbers are matched on their
 phone JID, or a contacts-formatted number. A name can still be used as a key as a
 fallback, but an ID is reliable. The matching identifiers for anyone are printed in
 their section, so you can copy one straight from there.
+
+### Adding someone by name
+
+You rarely know a number off the top of your head, and a contact may have several. So
+instead of editing the JSON by hand, run the picker:
+
+```bash
+python3 followuper.py --ignore            # prompts for a name to search
+python3 followuper.py --ignore "Diana"    # pre-fills the search with "Diana"
+```
+
+It searches your macOS Contacts by name, lists the matches with **all** the numbers and
+emails on each card, and snoozes the one you pick — writing every identifier on that
+card to the ignore file with today's date. One pick covers a person no matter which of
+their numbers they text from. It loops so you can add several in a sitting; a blank
+search quits.
 
 **Auto-resurfacing:** a snoozed person stays hidden only while their most recent
 message is on or before the `since` date. The moment they send something newer, they

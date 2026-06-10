@@ -20,6 +20,8 @@ Usage:
     python3 followuper.py --months 3 --ignore-file mine.json   # custom ignore list
     python3 followuper.py --months 3 --max-chars 300     # cap each message's length
     python3 followuper.py --months 3 --full              # verbose Markdown instead
+    python3 followuper.py --ignore                       # add someone to the ignore list
+    python3 followuper.py --ignore "Diana"               # ...pre-filling the name search
 
 Output defaults to a token-lean format (one line per message) meant for feeding to an
 AI. Pass --full for the verbose, human-readable Markdown instead.
@@ -301,6 +303,106 @@ def load_contacts():
     except sqlite3.Error as exc:
         print(f"# Note: could not read Contacts DB: {exc}", file=sys.stderr)
     return phone_to_name, email_to_name, token_to_record
+
+
+def load_contact_cards():
+    """Read Contacts grouped by person, for the `--ignore` picker (read-only).
+
+    Returns a list of {"name", "identifiers"} — one entry per address-book card that
+    has a name and at least one phone or email. `identifiers` holds *every* phone and
+    email on the card, so ignoring the person covers all their numbers in one shot
+    (the whole reason a name-based picker is worth having). Empty if Contacts can't be
+    read. Sorted by name for a stable picker order.
+    """
+    sources = glob.glob(os.path.expanduser(
+        "~/Library/Application Support/AddressBook/Sources/*/AddressBook-v22.abcddb"
+    ))
+    if not sources:
+        return []
+
+    def card_name(first, last, nick, org):
+        return (f"{first or ''} {last or ''}".strip() or nick or org or "")
+
+    def clean_identifier(value):
+        # Phones keep only digits and a leading +; emails lowercase. The ignore list
+        # matches on the last 10 digits regardless, so this is just for a tidy file.
+        v = (value or "").strip()
+        return v.lower() if "@" in v else re.sub(r"[^\d+]", "", v)
+
+    cards = {}  # record Z_PK -> {"name", "identifiers": set}
+    try:
+        conn = sqlite3.connect(f"file:{sources[0]}?mode=ro", uri=True)
+        for table, column in (("ZABCDPHONENUMBER", "ZFULLNUMBER"),
+                              ("ZABCDEMAILADDRESS", "ZADDRESS")):
+            for row in conn.execute(f"""
+                SELECT r.Z_PK, r.ZFIRSTNAME, r.ZLASTNAME, r.ZNICKNAME, r.ZORGANIZATION,
+                       t.{column}
+                FROM {table} t JOIN ZABCDRECORD r ON t.ZOWNER = r.Z_PK
+            """):
+                ident = clean_identifier(row[5])
+                if not ident:
+                    continue
+                card = cards.setdefault(row[0],
+                                        {"name": card_name(*row[1:5]), "identifiers": set()})
+                card["identifiers"].add(ident)
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"# Note: could not read Contacts DB: {exc}", file=sys.stderr)
+        return []
+
+    result = [{"name": c["name"], "identifiers": sorted(c["identifiers"])}
+              for c in cards.values() if c["name"] and c["identifiers"]]
+    result.sort(key=lambda c: c["name"].lower())
+    return result
+
+
+def add_to_ignore(ignore_path, initial_query=""):
+    """Interactive picker: search Contacts by name and snooze the person you pick.
+
+    Writes every identifier on the chosen card into `ignore_path` with today's date,
+    so any number that person texts from is covered. Loops so you can add several in
+    one sitting; a blank search quits. Run straight from the terminal (it reads stdin).
+    """
+    cards = load_contact_cards()
+    if not cards:
+        log("No Contacts found to search — add identifiers to the ignore file by hand.")
+        return
+
+    data = {}
+    if os.path.exists(ignore_path):
+        with open(ignore_path, encoding="utf-8") as fh:
+            text = fh.read().strip()
+        data = json.loads(text) if text else {}
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    query = initial_query
+    while True:
+        if not query:
+            query = input("search contacts (blank to quit): ").strip()
+        if not query:
+            break
+        matches = [c for c in cards if query.lower() in c["name"].lower()]
+        query = ""  # consumed; prompt fresh next round
+        if not matches:
+            print("  no matches")
+            continue
+        for i, c in enumerate(matches, 1):
+            print(f"  {i}. {c['name']:<24} {', '.join(c['identifiers'])}")
+        sel = input("ignore which # (blank to search again)? ").strip()
+        if not sel:
+            continue
+        try:
+            chosen = matches[int(sel) - 1]
+        except (ValueError, IndexError):
+            print("  invalid selection")
+            continue
+        for ident in chosen["identifiers"]:
+            data[ident] = {"since": today, "note": chosen["name"]}
+        with open(ignore_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        print(f"✓ ignored {chosen['name']} ({', '.join(chosen['identifiers'])}) "
+              f"— added to {os.path.basename(ignore_path)}")
 
 
 def merge_by_contact(persons, token_to_record):
@@ -611,6 +713,12 @@ def main():
                         help="JSON file of names to skip, mapped to the date you "
                              "snoozed them (default: ignore.json next to this script). "
                              "A snoozed person reappears once they send a newer message.")
+    parser.add_argument("--ignore", nargs="?", const="", default=None,
+                        metavar="NAME",
+                        help="Add someone to the ignore file by name instead of "
+                             "exporting: searches Contacts, lists matches (with all "
+                             "their numbers), and snoozes the one you pick. Pass a name "
+                             "to pre-fill the search, or bare --ignore to be prompted.")
     parser.add_argument("--full", action="store_true",
                         help="Verbose, human-readable Markdown instead of the default "
                              "token-lean compact format.")
@@ -618,6 +726,11 @@ def main():
                         help="In compact mode, truncate each message to this many "
                              "characters (default: 0 = no truncation).")
     args = parser.parse_args()
+
+    # --ignore is a maintenance mode, not an export: add a person and stop.
+    if args.ignore is not None:
+        add_to_ignore(args.ignore_file, args.ignore)
+        return
 
     if args.months <= 0:
         parser.error("--months must be a positive integer")
