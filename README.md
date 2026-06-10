@@ -37,8 +37,9 @@ prioritized list of who you owe a reply.
   appended to the message they target (`[them: ❤️]`), so a question that was
   acknowledged with a thumbs-up doesn't read as ignored.
 - **One-command AI review.** `./followups.sh` pipes the export straight into Claude
-  Code's headless mode (`claude -p`) and returns a prioritized follow-up list — and the
-  private message content never touches disk along the way.
+  Code's headless mode (`claude -p`) and returns a prioritized follow-up list. This step
+  sends your conversations to Anthropic's API for analysis — see [Privacy &
+  safety](#privacy--safety) — but never writes them to a local file along the way.
 - **Email, gated on engagement (optional).** If Mail.app has your accounts synced, your
   1-on-1 email threads join the report — but only with people you've actually
   corresponded with. Mailing lists, anything with an unsubscribe header, and Mail's own
@@ -236,7 +237,8 @@ interactive session required:
 
 The criteria for what counts as a follow-up and the output format live inline in the
 script. The export (full of private message content) is piped straight into `claude -p`
-over stdin, so it never touches disk beyond the model's own context.
+over stdin — so it isn't written to a local file, but it **is** sent to Anthropic's API
+for analysis (see [Privacy & safety](#privacy--safety)).
 
 While it runs, `followuper.py` logs its export progress to **stderr** (reading Contacts,
 iMessage, WhatsApp, with message counts), so the export phase isn't opaque. Progress
@@ -442,17 +444,28 @@ comes back to life. To drop someone permanently, just delete their line.
 
 ## Privacy & safety
 
-- **Nothing leaves your machine** unless you choose to pipe the export somewhere. The
-  script itself makes no network calls.
+- **The export step makes no network calls.** `followuper.py` reads your local
+  databases and writes Markdown to stdout — nothing more. If you only run the export
+  (and don't pipe it onward), nothing leaves your machine.
+- **The AI review sends your conversations to Anthropic.** This is the one point where
+  data leaves your Mac, and only if you run it: `followups.sh` pipes the export into
+  `claude -p`, which transmits it to Anthropic's API for analysis — the same as any
+  other Claude prompt, subject to Anthropic's data-use terms. It's streamed over stdin
+  rather than written to a local file, so it isn't persisted to disk *on your machine*,
+  but it does go over the network. If that's not acceptable for your data, run the
+  export alone and review it yourself, or point it at a model you host.
 - **The databases are never modified.** Both are opened strictly read-only (SQLite
   `mode=ro`), and the script only ever runs `SELECT` queries — it never writes to,
   copies over, or alters the original files.
-- **The AI review keeps message content off disk.** `followups.sh` streams the export
-  into `claude -p` over stdin, so private conversations are never persisted to an
-  intermediate file.
 
 ## Known limitations
 
+- **It's at the mercy of the desktop apps' syncing.** followuper reads the local
+  databases that WhatsApp Desktop, Mail.app, and Calendar.app maintain — it never
+  fetches anything itself. If one of those apps stops syncing (unlinked from your
+  phone, signed out, account removed, notifications-off-but-also-quit), followuper
+  silently sees whatever stale snapshot the app last wrote. iMessage is the exception:
+  `chat.db` is the system store of record, not a synced mirror.
 - **WhatsApp Desktop is not a full archive.** It only contains messages that synced
   while the desktop app was linked to your phone, so its history may be shallower
   than iMessage's.
@@ -471,11 +484,28 @@ comes back to life. To drop someone permanently, just delete their line.
   recurrences as rules rather than expanded occurrences, so the calendar section only
   shows one-off events (and individually modified occurrences). Ad-hoc meeting
   invites — the case that matters for follow-ups — are one-offs.
-- **The calendar window is fixed** (7 days back → 14 days ahead). A meeting scheduled
-  in an old thread that happened more than a week ago falls outside it, so the model
-  can't use the calendar to confirm that one took place.
 - Reading `~/Library/Messages/` may require granting your terminal **Full Disk
   Access** in System Settings → Privacy & Security.
+
+(The fixed 7-days-back → 14-days-ahead calendar window is a deliberate design choice,
+not a constraint — see [Calendar cross-check](#calendar-cross-check-optional) for why.)
+
+## Future work
+
+Candidate sources that would extend the same "who's waiting on a reply from me?" idea
+beyond personal texts, roughly in order of value:
+
+- **LinkedIn** — the highest-value addition for professional follow-ups (recruiters,
+  intros, cold-but-warming threads), but also the hardest: there's no local Apple-style
+  database to read, so it would need a different access path than the local-first
+  trick the rest of the tool relies on.
+- **Slack** and **Discord** — community and work conversations where dropped threads
+  pile up. Both ship Electron desktop apps with local caches, so they may be reachable
+  in the same local-first spirit, subject to each app's storage format.
+
+These are exploratory, not committed. The guiding constraint stays the same: prefer a
+local, read-only, no-OAuth source the way iMessage, WhatsApp, Mail, and Calendar are
+today.
 
 ## License
 
