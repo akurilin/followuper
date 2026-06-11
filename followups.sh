@@ -80,6 +80,8 @@ Give a **prioritized** list, grouped:
 - 🟡 **Stale / overdue loops** — "reconnect soon" that never happened.
 - ⚪ **Optional** — casual chats that fizzled; keep-warm only.
 
+Omit any group with no items entirely — no header, no "nothing here" note.
+
 For each: the person's name, a one-line reason, and the key quote or fact that
 triggered it. End with a brief note on what was excluded (businesses,
 ball-in-their-court, closed threads) so I can sanity-check. Offer to draft replies,
